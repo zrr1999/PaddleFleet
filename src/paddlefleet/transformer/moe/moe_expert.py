@@ -162,6 +162,49 @@ class DeepGEMMBMMFunction(paddle.autograd.PyLayer):
         return dx, dy
 
 
+class _UACExpertFp32WgradCapture(paddle.autograd.PyLayer):
+    """Identity on the GEMM output. Captures fp32 X.T@dY into weight.main_grad[e].
+
+    Must return the incoming dY unchanged. Reconstructing dX (E-476) dropped 59/59.
+    MixPrecision is skipped by claiming main_grad on the Parameter in __init__.
+    """
+
+    _hit = 0
+
+    @staticmethod
+    def forward(ctx, y, x, weight, expert_index):
+        ctx.save_for_backward(x)
+        ctx.weight = weight
+        ctx.expert_index = int(expert_index)
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        (x,) = ctx.saved_tensor()
+        if dy is None or x.shape[0] == 0:
+            return dy, None, None
+        wg = paddle.matmul(
+            x.astype("float32"),
+            dy.detach().astype("float32"),
+            transpose_x=True,
+        )
+        weight = ctx.weight
+        e = ctx.expert_index
+        if weight.main_grad is None:
+            weight.main_grad = paddle.zeros(weight.shape, dtype="float32")
+        weight.main_grad[e].add_(wg)
+        if hasattr(weight, "grad_added_to_main_grad"):
+            weight.grad_added_to_main_grad = True
+        _UACExpertFp32WgradCapture._hit += 1
+        if _UACExpertFp32WgradCapture._hit <= 8:
+            print(
+                f"[UAC-EXPERT-FP32-HOOK] hit={_UACExpertFp32WgradCapture._hit} "
+                f"e={e} x={tuple(x.shape)} y={tuple(dy.shape)}",
+                flush=True,
+            )
+        return dy, None, None
+
+
 class GroupedMLPExpert(FleetLayer):
     """An efficient implementation of the Experts layer using GroupedGEMM without TP/DP.
 
@@ -277,6 +320,11 @@ class GroupedMLPExpert(FleetLayer):
                 self.config.output_layer_init_method(self.weight2)
         self.weight1.is_distributed = self.expert_parallel
         self.weight2.is_distributed = self.expert_parallel
+        # Claim main_grad so MixPrecision skips these Parameters. The
+        # identity output capture writes fp32 X.T@dY into this buffer.
+        if getattr(self.config, "use_accuracy_compatible", False):
+            self.weight1.main_grad = None
+            self.weight2.main_grad = None
 
     def muon_slice_specs(self, muon_configs):
         """Muon orthogonal-slice specs for fused grouped-gemm expert weights.
@@ -379,45 +427,51 @@ class GroupedMLPExpert(FleetLayer):
                                 _i1 += 1
                             _seg = _xb[_i0:_i1]
                             if _use_flinear:
-                                _h = self.activation_func(
-                                    paddle.nn.functional.linear(_seg, self.weight1[_e])
-                                )
+                                _h = paddle.nn.functional.linear(_seg, self.weight1[_e])
                             else:
-                                _h = self.activation_func(
-                                    paddle.matmul(_seg, _wt1, transpose_y=True)
-                                )
+                                _h = paddle.matmul(_seg, _wt1, transpose_y=True)
+                            _h = _UACExpertFp32WgradCapture.apply(
+                                _h, _seg, self.weight1, _e
+                            )
+                            _h = self.activation_func(_h)
                             if _probs_blk is not None:
                                 _od = _h.dtype
                                 _h = (
                                     _h * _probs_blk[_i0:_i1].unsqueeze(-1)
                                 ).to(_od)
+                            _h_in = _h
                             if _use_flinear:
-                                _h = paddle.nn.functional.linear(_h, self.weight2[_e])
+                                _h = paddle.nn.functional.linear(_h_in, self.weight2[_e])
                             else:
-                                _h = paddle.matmul(_h, _wt2, transpose_y=True)
+                                _h = paddle.matmul(_h_in, _wt2, transpose_y=True)
+                            _h = _UACExpertFp32WgradCapture.apply(
+                                _h, _h_in, self.weight2, _e
+                            )
                             _sub.append(_h)
                             _i0 = _i1
                         out_parts.append(paddle.concat(_sub, axis=0))
                     else:
                         if _use_flinear:
-                            _h = self.activation_func(
-                                paddle.nn.functional.linear(_xb, self.weight1[_e])
-                            )
+                            _h = paddle.nn.functional.linear(_xb, self.weight1[_e])
                         else:
-                            _h = self.activation_func(
-                                paddle.matmul(_xb, _wt1, transpose_y=True)
-                            )
+                            _h = paddle.matmul(_xb, _wt1, transpose_y=True)
+                        _h = _UACExpertFp32WgradCapture.apply(
+                            _h, _xb, self.weight1, _e
+                        )
+                        _h = self.activation_func(_h)
                         if _probs_blk is not None:
                             _od = _h.dtype
                             _h = (_h * _probs_blk.unsqueeze(-1)).to(_od)
+                        _h_in = _h
                         if _use_flinear:
-                            out_parts.append(
-                                paddle.nn.functional.linear(_h, self.weight2[_e])
-                            )
+                            _h = paddle.nn.functional.linear(_h_in, self.weight2[_e])
                         else:
-                            out_parts.append(
-                                paddle.matmul(_h, _wt2, transpose_y=True)
+                            _h = paddle.matmul(_h_in, _wt2, transpose_y=True)
+                        out_parts.append(
+                            _UACExpertFp32WgradCapture.apply(
+                                _h, _h_in, self.weight2, _e
                             )
+                        )
                     _x_start += _n
                 fc2_output = paddle.concat(out_parts, axis=0)
             elif self.moe_deep_gemm:

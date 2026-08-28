@@ -164,12 +164,20 @@ class FusedGateDetachMatmul(paddle.autograd.PyLayer):
     """
 
     @staticmethod
-    def forward(ctx, x, w, dw_p2p_overlap=False, use_accuracy_compatible=False):
+    def forward(
+        ctx,
+        x,
+        w,
+        dw_p2p_overlap=False,
+        use_accuracy_compatible=False,
+        sequence_shards=1,
+    ):
         """
         forward
         """
         ctx.dw_p2p_overlap = dw_p2p_overlap
         ctx.use_accuracy_compatible = use_accuracy_compatible
+        ctx.sequence_shards = int(sequence_shards) if sequence_shards else 1
         ctx.dtype = paddle.float32
         ctx.save_for_backward(x, w)
         w = w.T
@@ -236,15 +244,42 @@ class FusedGateDetachMatmul(paddle.autograd.PyLayer):
                 return x_grad, None
         else:
             if ctx.use_accuracy_compatible:
-                # Mirror MG `RouterGatingLinearFunction.backward`:
-                #   grad_input  = torch.mm(grad_output, weight.to(router_dtype))
-                #   grad_weight = torch.mm(grad_output.t(), inp.to(router_dtype))
-                # i.e. two separate GEMMs (not a fused matmul_grad), then each
-                # gradient cast back to its own storage dtype.
+                # Mirror MG `gating()` under `router_accuracy_compatible`:
+                # eager `torch.mm(x.float(), weight.float().t())`. The GEMM is
+                # fp32, but MG stores the gate as `params_dtype` (bf16), so
+                # autograd rounds each rank's wgrad through bf16 before the
+                # fp32 `main_grad` add; SP then SUMs those rounded buffers.
+                # Paddle keeps the gate in fp32 for checkpoint loading, so the
+                # same roundtrip has to be applied here. A single M=union GEMM
+                # is also not M-invariant with the sum of per-shard GEMMs
+                # (E-269: MTP d(logits) 0diff, g_router still open; E-271:
+                # live torch sha = per-shard mm → bf16 → fp32 → sum → /tokens).
+                def _round_wgrad_through_params_dtype(g):
+                    return g.cast(paddle.bfloat16).cast(paddle.float32)
+
                 x_g = paddle.matmul(y_grad, w.cast(ctx.dtype))
-                w_g = paddle.matmul(y_grad, x.cast(ctx.dtype), transpose_x=True)
+                x_cast = x.cast(ctx.dtype)
+                shards = ctx.sequence_shards
+                if shards > 1 and x_cast.shape[0] % shards == 0:
+                    shard = int(x_cast.shape[0]) // shards
+                    w_g = _round_wgrad_through_params_dtype(
+                        paddle.matmul(
+                            y_grad[:shard], x_cast[:shard], transpose_x=True
+                        )
+                    )
+                    for i in range(1, shards):
+                        sl = slice(i * shard, (i + 1) * shard)
+                        w_g = w_g + _round_wgrad_through_params_dtype(
+                            paddle.matmul(
+                                y_grad[sl], x_cast[sl], transpose_x=True
+                            )
+                        )
+                else:
+                    w_g = _round_wgrad_through_params_dtype(
+                        paddle.matmul(y_grad, x_cast, transpose_x=True)
+                    )
                 x_grad = x_g.cast(x.dtype) if not x_stop_grad else None
-                w_grad = w_g.cast(w.dtype) if not w_stop_grad else None
+                w_grad = w_g if not w_stop_grad else None
                 return x_grad, w_grad
             else:
                 w = w.T
@@ -271,10 +306,15 @@ def gate_detach_matmul(
     moe_router_force_load_balancing=False,
     dw_p2p_overlap=False,
     use_accuracy_compatible=False,
+    sequence_shards=1,
 ):
     if use_fuse:
         score = FusedGateDetachMatmul.apply(
-            x, weight, dw_p2p_overlap, use_accuracy_compatible
+            x,
+            weight,
+            dw_p2p_overlap,
+            use_accuracy_compatible,
+            sequence_shards,
         )
     else:
         x = x.cast(paddle.float32)
@@ -360,19 +400,33 @@ class StandardMoERouter(nn.Layer):
                 f"but got {self.scoring_func!r}. "
             )
 
-        # Initialize gate weight with Normal distribution aligned with Megatron.
-        if self.use_accuracy_compatible:
-            self.weight = paddle.create_parameter(
-                shape=[self.num_experts, self.hidden_size],
-                dtype=config.params_dtype,
-                default_initializer=paddle.nn.initializer.Constant(0.0),
-            )
-        else:
-            self.weight = paddle.create_parameter(
-                shape=[self.num_experts, self.hidden_size],
-                dtype="float32",
-                default_initializer=paddle.nn.initializer.Constant(0.0),
-            )
+        # The router gate is always stored in float32.
+        #
+        # Storing it in ``config.params_dtype`` (bf16) silently breaks weight
+        # loading: every PaddleFormers checkpoint mapping for MoE gates targets
+        # float32 (see ``aoa_config_base._get_moe_expert_statements``, which emits
+        # "...mlp.gate.weight -> ....mlp.gate.weight, dtype='float32'"), so a
+        # bf16 gate parameter is skipped by the loader, reported only as an
+        # "Unexpected key" warning, and keeps its random ``init_method`` value for
+        # the whole run. That produced gate logits with std ~= init_method_std
+        # instead of the checkpoint's, mis-routed every token, and made the first
+        # MoE layer numerically unrelated to the reference implementation.
+        #
+        # float32 storage is also faithful to Megatron-LM: ``Router.__init__``
+        # allocates the gate as float32 and ``gating()`` promotes it to the router
+        # dtype (float32 for this model) before the GEMM, so a float32 parameter
+        # holding checkpoint values that originate from bf16 reproduces the
+        # reference logits bit-exactly. The one place the reference does depend on
+        # bf16 storage is the weight gradient: MG then casts the Parameter to
+        # ``params_dtype`` (bf16), so autograd rounds each rank's wgrad through
+        # bf16 before the fp32 ``main_grad`` add. Paddle cannot store the gate
+        # as bf16 (loader skip), so ``FusedGateDetachMatmul.backward`` applies
+        # that roundtrip explicitly under ``use_accuracy_compatible``.
+        self.weight = paddle.create_parameter(
+            shape=[self.num_experts, self.hidden_size],
+            dtype="float32",
+            default_initializer=paddle.nn.initializer.Constant(0.0),
+        )
         config.init_method(self.weight)
 
         if (
@@ -1599,6 +1653,11 @@ class TopKRouter(StandardMoERouter):
                 # gate, view 1 uses the new self.weight_1 projection. Both
                 # reuse the fused gate matmul so they share the
                 # force-load-balancing and dw_p2p_overlap paths.
+                _sp_shards = (
+                    self.tensor_model_parallel_size
+                    if self.sequence_parallel
+                    else 1
+                )
                 logits_0 = gate_detach_matmul(
                     input,
                     self.weight,
@@ -1606,6 +1665,7 @@ class TopKRouter(StandardMoERouter):
                     self.config.moe_router_force_load_balancing,
                     getattr(self.config, "dw_p2p_overlap", False),
                     self.use_accuracy_compatible,
+                    _sp_shards,
                 )
                 logits_1 = gate_detach_matmul(
                     input,
@@ -1614,6 +1674,7 @@ class TopKRouter(StandardMoERouter):
                     self.config.moe_router_force_load_balancing,
                     getattr(self.config, "dw_p2p_overlap", False),
                     self.use_accuracy_compatible,
+                    _sp_shards,
                 )
                 # The two-view contract is sigmoid + sigmoid. scoring_func is
                 # guaranteed to be "sigmoid" here (validated above and in
@@ -1631,6 +1692,9 @@ class TopKRouter(StandardMoERouter):
                     self.config.moe_router_force_load_balancing,
                     getattr(self.config, "dw_p2p_overlap", False),
                     self.use_accuracy_compatible,
+                    self.tensor_model_parallel_size
+                    if self.sequence_parallel
+                    else 1,
                 )
 
         _log_moe_md5(logits, "gate_logits", self._layer_number)
@@ -1687,8 +1751,31 @@ class TopKRouter(StandardMoERouter):
             )
             logits = logits * valid_mask
             gates = gates * valid_mask
+            _lg_dump = os.environ.get("MODEL_REPRO_ROUTER_LOGITS_DUMP_DIR")
+            if _lg_dump:
+                import paddle.distributed as _lgd
+                import os as _lgo
+                _lgk = _lgd.get_rank() if _lgd.is_initialized() else 0
+                _lgl = getattr(self, "layer_number", None)
+                _lgo.makedirs(_lg_dump, exist_ok=True)
+                logits.detach().astype("float32").cpu().numpy().tofile(
+                    _lgo.path.join(_lg_dump, f"paddle_gate_scores_l{_lgl}_r{_lgk}.f32.bin")
+                )
 
         _log_moe_md5(gates, "gate_probs_sigmoid", self._layer_number)
+
+        _score_dump_dir = os.environ.get("MODEL_REPRO_ROUTER_SCORES_DUMP_DIR")
+        if _score_dump_dir:
+            import paddle.distributed as _pd2
+
+            _srank = _pd2.get_rank() if _pd2.is_initialized() else 0
+            os.makedirs(_score_dump_dir, exist_ok=True)
+            gates.detach().astype("float32").cpu().numpy().tofile(
+                os.path.join(
+                    _score_dump_dir,
+                    f"paddle_gate_scores_l{self._layer_number}_r{_srank}.f32.bin",
+                )
+            )
 
         # Use clone() to ensure that the execution order of the grad nodes is consistent with EC.
         if self.use_accuracy_compatible and not use_split:

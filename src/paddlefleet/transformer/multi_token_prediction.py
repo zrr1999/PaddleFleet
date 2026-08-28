@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -40,6 +41,7 @@ from paddlefleet.parallel_state import (
 from paddlefleet.process_groups_config import ProcessGroupCollection
 from paddlefleet.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
+    reduce_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
 from paddlefleet.tensor_parallel.random import get_cuda_rng_tracker
@@ -57,6 +59,68 @@ SUPPORTED_ATTN_MASK = [
     AttnMaskType.no_mask,
     AttnMaskType.padding_causal,
 ]
+
+
+def _mtp_trace(name: str, tensor) -> None:
+    """Cross-framework audit anchor for the MTP branch forward.
+
+    E-216 pinned the divergence to this branch: the MAIN per-token cross-entropy is
+    bit-exact at every supervised position while the MTP one differs at all of them,
+    and both traverse the same output layer and the same CE kernel, so the difference
+    is already in the hidden state this branch produces. The branch is short, so every
+    intermediate is recorded here and in the Megatron-LM counterpart under the same NAME.
+
+    Anchors are keyed by name rather than by emission order on purpose: E-216 was nearly
+    misread because Megatron computes the MTP loss BEFORE the main logits while this side
+    emits the main loss first, so pairing prints by order compares the main path against
+    the MTP path.
+
+    Records go to one JSONL file per rank rather than to stdout: four ranks interleave
+    on a shared stdout and long runs get truncated, so stdout cannot be trusted to carry
+    a complete record.
+    """
+    out_dir = os.environ.get("MODEL_REPRO_MTP_TRACE_DIR")
+    if not out_dir:
+        return
+    import hashlib as _hashlib
+    import json as _json
+
+    rank = paddle.distributed.get_rank()
+    if tensor is None:
+        record = {"rank": rank, "name": name, "value": None}
+    else:
+        _b = tensor.detach().cast("float32").numpy()
+        _d = _b.astype("float64")
+        _rows = _d.reshape([_d.shape[0], -1]) if _d.ndim > 1 else _d.reshape([1, -1])
+        record = {
+            "rank": rank,
+            "name": name,
+            "shape": list(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "md5": _hashlib.md5(_b.tobytes()).hexdigest(),
+            "sum": float(_d.sum()),
+            "abssum": float(abs(_d).sum()),
+            "absmax": float(abs(_d).max()) if _d.size else 0.0,
+            "numel": int(_d.size),
+            # Per-leading-index abssum. The leading dim is the sequence (or the
+            # sequence-parallel shard of it), so this localizes a difference to a
+            # position without carrying the payload: a whole-tensor digest says only
+            # that two buffers differ.
+            "row_abssum": [float(v) for v in abs(_rows).sum(axis=1)],
+        }
+        # Small integer/bool tensors are masks, ids and row-index encodings: their
+        # VALUES are the comparison, not their magnitude. A digest cannot answer
+        # "does this side's row-index mask mean the same thing as the other side's
+        # dense bool mask", and these tensors are tiny, so transcribe them.
+        if (
+            "int" in str(tensor.dtype) or "bool" in str(tensor.dtype)
+        ) and _d.size <= 8192:
+            record["values"] = [int(v) for v in _d.reshape([-1]).tolist()]
+    os.makedirs(out_dir, exist_ok=True)
+    with open(
+        os.path.join(out_dir, f"rank{rank}.jsonl"), "a", encoding="utf-8"
+    ) as stream:
+        stream.write(_json.dumps(record, sort_keys=True) + "\n")
 
 
 class MTPLossLoggingHelper:
@@ -262,6 +326,32 @@ class MTPLossAutoScaler(paddle.autograd.PyLayer):
         MTPLossAutoScaler.main_loss_backward_scale = scale
 
 
+def _validate_mtp_variable_length_carriers(dict_args: dict):
+    startend = dict_args.get("mtp_startend_row_indices_all", None)
+    hidden_mask = dict_args.get("mtp_hidden_inputs_mask_all", None)
+    if (startend is None) != (hidden_mask is None):
+        raise ValueError(
+            "mtp_startend_row_indices_all and mtp_hidden_inputs_mask_all "
+            "must both be present or both be absent."
+        )
+    return startend, hidden_mask
+
+
+class _SliceFwdLookupBwd(paddle.autograd.PyLayer):
+    """Unused. E-379 last-stage wrap 4/59; E-411 assign wrap 3/59."""
+
+    @staticmethod
+    def forward(ctx, slice_det, lookup_sp):
+        ctx.save_for_backward(lookup_sp)
+        out = paddle.empty_like(slice_det)
+        paddle.assign(slice_det, out)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return None, grad_output
+
+
 class MultiTokenPredictionLayer(FleetLayer):
     """The implementation for Multi-Token Prediction (MTP) which extends
     the prediction scope to multiple future tokens at each position.
@@ -428,7 +518,11 @@ class MultiTokenPredictionLayer(FleetLayer):
                 eps=self.config.rms_norm_eps,
             )
 
-        # MTP Magic Send: per-layer embedding and counter
+        # Last-stage embedding copy is magic-send only. UAC extra Parameter
+        # + pipe_group allreduce drops the scan to 4/59 even with no hook
+        # (E-382). E-410/411 last-stage lookup as enorm / PyLayer wrap
+        # dropped to 3/59 (enorm ulp, r0 7758.85). Do not instantiate
+        # mtp_embed on the UAC path.
         self.mtp_embed = None
         if config.enable_mtp_magic_send:
             import copy
@@ -443,6 +537,9 @@ class MultiTokenPredictionLayer(FleetLayer):
                 num_embeddings=config.vocab_size,
                 embedding_dim=config.hidden_size,
                 init_method=config.embedding_init_method,
+                # Match stage-0: TP allreduce inside the lookup, then
+                # ScatterOp on the activation (gpt_embedding.py). RS here
+                # would be a different collective than the concat slice.
                 reduce_scatter_embeddings=False,
                 config=no_init_cfg,
             )
@@ -455,12 +552,13 @@ class MultiTokenPredictionLayer(FleetLayer):
                     self.mtp_embed
                 )
 
-            from paddlefleet.models.gpt.mtp_embedding_layer import (
-                mtp_magic_instance,
-            )
+            if config.enable_mtp_magic_send:
+                from paddlefleet.models.gpt.mtp_embedding_layer import (
+                    mtp_magic_instance,
+                )
 
-            self.magic_key = f"mtp_layer_{self.layer_number}"
-            mtp_magic_instance.set_magic_count(self.magic_key, -1)
+                self.magic_key = f"mtp_layer_{self.layer_number}"
+                mtp_magic_instance.set_magic_count(self.magic_key, -1)
 
         self.offload_context = nullcontext()
 
@@ -482,6 +580,7 @@ class MultiTokenPredictionLayer(FleetLayer):
         In non-mHC mode, concatenates and projects with eh_proj as before.
         """
         decoder_input = self.enorm(decoder_input)
+        _mtp_trace("enorm_out", decoder_input)
 
         if self.mhc_enabled:
             # mHC mode: hidden_states is [s, b, n*h]
@@ -548,9 +647,28 @@ class MultiTokenPredictionLayer(FleetLayer):
                 )
         else:
             hidden_states = self.hnorm(hidden_states)
+            _mtp_trace("hnorm_out", hidden_states)
             # Apply mtp_hidden_inputs_mask to mask out hidden state contributions
             # at specific positions (e.g. EOS boundaries) in MTP.
             # mask shape: [B, 1, S] -> [B, S, 1] to broadcast with hidden_states [B, S, H]
+            #
+            # E-181: Megatron-LM has no equivalent of this mask. Its MTP path
+            # (megatron/core/transformer/multi_token_prediction.py) rolls ``loss_mask``
+            # in lockstep with the label shift, so a document-boundary position is
+            # excluded from the MTP LOSS while its hidden input is left untouched.
+            # Masking the hidden input instead changes eh_proj's forward output and its
+            # backward at those positions, which showed up as the boundary row and the
+            # final row of mtp_eh_proj_output differing while enorm/hnorm were
+            # bit-exact. Under ``use_accuracy_compatible`` follow the reference and
+            # skip the multiplication; the loss-side masking already removes those
+            # positions from the objective, and causal attention means a masked
+            # position can only influence later positions, which are padding.
+            if getattr(self.config, "use_accuracy_compatible", False):
+                mtp_hidden_inputs_mask = None
+            _mtp_trace(
+                "mtp_hidden_inputs_mask",
+                mtp_hidden_inputs_mask,
+            )
             if mtp_hidden_inputs_mask is not None:
                 mtp_hidden_inputs_mask = mtp_hidden_inputs_mask.transpose(
                     [0, 2, 1]
@@ -594,9 +712,11 @@ class MultiTokenPredictionLayer(FleetLayer):
             # At the (k - 1)-th MTP layer, concatenates the i-th token's hidden_states
             # and the (i + K)-th token's embedding, and combine them with linear projection.
             hidden_states = paddle.cat((decoder_input, hidden_states), -1)
+            _mtp_trace("concat_out", hidden_states)
             hidden_states = self.eh_proj(hidden_states)
             if isinstance(hidden_states, tuple):
                 hidden_states, _ = hidden_states
+            _mtp_trace("eh_proj_out", hidden_states)
             # For tensor parallel we need to gather the tensor across the model-parallel
             # ranks after the linear projection. This used to call
             # `all_gather_last_dim_from_tensor_parallel_region`, but that utility reduces
@@ -607,11 +727,13 @@ class MultiTokenPredictionLayer(FleetLayer):
                     hidden_states = gather_from_tensor_model_parallel_region(
                         hidden_states
                     )
+                _mtp_trace("after_tp_gather", hidden_states)
                 # For sequence parallel, scatter after linear_fc and before transformer layer.
                 if self.sequence_parallel:
                     hidden_states = scatter_to_sequence_parallel_region(
                         hidden_states
                     )
+        _mtp_trace("concat_embeddings_out", hidden_states)
         return hidden_states
 
     def _proj_and_transformer_layer(
@@ -643,6 +765,9 @@ class MultiTokenPredictionLayer(FleetLayer):
         else:
             rng_context = nullcontext()
 
+        _mtp_trace("mtp_trunk_hidden_in", hidden_states)
+        _mtp_trace("mtp_decoder_input", decoder_input)
+
         with rng_context:
             hidden_states = self._concat_embeddings(
                 hidden_states, decoder_input, mtp_hidden_inputs_mask
@@ -668,7 +793,29 @@ class MultiTokenPredictionLayer(FleetLayer):
             }
             rst_dict = self.transformer_layer(input_dict)
 
+            # E-219 eliminated the attention-mask axis for this layer and promoted the
+            # rotary embeddings: this side re-trims rope for MTP while the reference
+            # reuses the trunk rope. Anchor the layer's non-hidden inputs here, AFTER
+            # the call, so nothing about the call itself is perturbed; the dict is the
+            # exact object the layer received.
+            #
+            # None is recorded rather than skipped: "this side passed nothing" is itself
+            # the comparison result when the reference passes a tensor, and skipping it
+            # would be indistinguishable from the anchor never running.
+            for _name in (
+                "rotary_pos_emb",
+                "rotary_pos_cos",
+                "rotary_pos_sin",
+                "attention_mask",
+                "attention_bias",
+                "attn_mask_startend_row_indices",
+                "position_ids",
+                "input_ids",
+            ):
+                _mtp_trace(f"mtp_model_layer_{_name}", input_dict.get(_name))
+
         hidden_states = rst_dict["hidden_states"]
+        _mtp_trace("transformer_layer_out", hidden_states)
 
         # In mHC mode, skip postprocess here - it's deferred to forward()
         # so we can keep multi-stream state for subsequent MTP layers.
@@ -677,6 +824,7 @@ class MultiTokenPredictionLayer(FleetLayer):
             and not self.config.gpt_model_use_experimental_version
         ):
             hidden_states = self.norm(hidden_states)
+            _mtp_trace("final_layernorm_out", hidden_states)
 
         return hidden_states
 
@@ -804,6 +952,8 @@ class MultiTokenPredictionLayer(FleetLayer):
             assert dict_args["packed_seq_params"] is None, (
                 "multi token prediction + sequence packing is not yet supported."
             )
+
+        _validate_mtp_variable_length_carriers(dict_args)
 
         # === Magic Send branch ===
         if self.config.enable_mtp_magic_send:
@@ -1207,7 +1357,8 @@ class MultiTokenPredictionLayer(FleetLayer):
                 dict_args["hidden_states"] = mhc_chunks[self.layer_number]
             else:
                 dict_args["hidden_states"] = tensor_list[self.layer_number]
-            dict_args["decoder_input"] = tensor_list[self.layer_number + 1]
+            slice_emb = tensor_list[self.layer_number + 1]
+            dict_args["decoder_input"] = slice_emb
 
             # New dataflow: get the mask for this layer's depth, shape [B, 1, S, 1]
             mtp_mask = None

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -206,6 +207,29 @@ class MLP(FleetLayer):
         nvtx_range_pop(suffix="up_gate_proj")
 
         nvtx_range_push(suffix="activation")
+
+        if os.environ.get("MODEL_REPRO_SWIGLU_EAGER", "0") == "1":
+            # E-092 probe: mirror mcore's swiglu_eager exactly
+            # (chunk(y, 2, -1) -> F.silu(y_1) * y_2) instead of the fused kernels,
+            # so the bf16 activation between the bit-exact fc1 and fc2 matches torch.
+            if bias_parallel is not None:
+                intermediate_parallel = intermediate_parallel + bias_parallel
+            _y1, _y2 = paddle.chunk(intermediate_parallel, 2, axis=-1)
+            intermediate_parallel = F.silu(_y1) * _y2
+            if per_token_scale is not None:
+                # E-112 probe: mcore folds the routing probability into the
+                # ACTIVATION before fc2 (Megatron experts.py:786-788):
+                #   original_dtype = x.dtype; x = x * probs; x = x.to(original_dtype)
+                # `per_token_scale` arrives already shaped [tokens, 1] from the MoE
+                # combine, matching mcore's permuted_probs broadcast.
+                _orig_dtype = intermediate_parallel.dtype
+                intermediate_parallel = intermediate_parallel * per_token_scale
+                intermediate_parallel = intermediate_parallel.to(_orig_dtype)
+            nvtx_range_pop(suffix="activation")
+            nvtx_range_push(suffix="down_proj")
+            output, output_bias = self.down_proj(intermediate_parallel)
+            nvtx_range_pop(suffix="down_proj")
+            return output, output_bias
 
         # Alignment mode: use Paddle native F.swiglu
         _use_paddle_swiglu = getattr(

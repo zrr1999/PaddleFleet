@@ -436,9 +436,29 @@ def get_attention_spec(
             },
             sublayers_spec=MLASelfAttentionSublayersSpec(
                 q_proj=backend.column_parallel_linear(),
-                q_a_proj=backend.column_parallel_linear(),
+                # The two MLA down-projections are TP-REPLICATED, not column
+                # sharded. Three independent references agree:
+                #   1. The official ``glm_moe_dsa`` HF implementation omits
+                #      ``q_a_proj`` from ``base_model_tp_plan`` (so it replicates)
+                #      and maps ``kv_a_proj_with_mqa`` to a non-sharding plan.
+                #   2. Megatron-Core builds ``linear_q_down_proj`` /
+                #      ``linear_kv_down_proj`` with ``backend.linear()``
+                #      (``TELinear`` with ``parallel_mode="duplicated"``) while
+                #      ``linear_q_proj`` stays column parallel --
+                #      ``megatron/core/models/gpt/gpt_layer_specs.py:122-128``.
+                #   3. PaddleFormers' own deepseek_v3 does the same for the same
+                #      pair: ``transformers/deepseek_v3/modeling.py:593-600`` and
+                #      ``:616-623`` pass ``linear_type="default"`` (a plain
+                #      ``paddle.nn.Linear``) while the neighbouring ``q_proj`` /
+                #      ``q_b_proj`` / ``kv_b_proj`` use ``"colwise"``. Its
+                #      ``:578-581`` note states the reason: these two are small
+                #      weights that gain nothing from being split.
+                # Sharding them instead produces a gradient that is validly but
+                # DIFFERENTLY reduced from the reference, which is why it shows up
+                # as a bit-level divergence rather than as a crash.
+                q_a_proj=backend.linear(),
                 q_b_proj=backend.column_parallel_linear(),
-                kv_a_proj_with_mqa=backend.column_parallel_linear(),
+                kv_a_proj_with_mqa=backend.linear(),
                 kv_b_proj=backend.column_parallel_linear(),
                 core_attention=core_attention,
                 o_proj=backend.row_parallel_linear(),

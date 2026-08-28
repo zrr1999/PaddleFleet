@@ -302,38 +302,191 @@ class GroupedMLPExpert(FleetLayer):
         self,
         permuted_local_hidden_states: paddle.Tensor,
         tokens_per_expert: paddle.Tensor,
+        permuted_probs: paddle.Tensor | None = None,
+        row_owner: paddle.Tensor | None = None,
     ):
-        """Forward step of the GroupedMLP without TP/DP."""
+        """Forward step of the GroupedMLP without TP/DP.
+
+        Args:
+            permuted_probs: Optional routing probs in permuted/expert-grouped
+                order, folded into the post-GLU activation BEFORE fc2 (mcore
+                semantics, Megatron experts.py:786-788):
+                    orig = x.dtype; x = x * probs; x = x.to(orig)
+                When set, the caller must NOT multiply probs after fc2 (e.g.
+                unpermute must be called with probs=None).
+            row_owner: Optional [num_permuted_rows] int tensor giving the SP
+                shard id of each permuted row (derived from sorted_indices).
+                With MODEL_REPRO_MOE_SHARD_GEMM=1 each expert's tokens are
+                batched per shard so the bf16 GEMM sees the same M as mcore's
+                per-shard expert calls.
+        """
 
         if permuted_local_hidden_states.numel() != 0:
             tokens_per_expert = tokens_per_expert.cpu().tolist()
             tokens_per_expert = [int(x) for x in tokens_per_expert]
 
-            if self.moe_deep_gemm:
+            # Accuracy-compatible expert GEMM (E-163). Megatron-LM issues a TN
+            # GEMM per expert against [out, in] weight storage; the fused/grouped
+            # BMM path below picks a different cuBLAS kernel whose bf16 rows differ
+            # in the last bits. Under ``config.use_accuracy_compatible`` take the
+            # per-expert TN path so the routed-expert output is bit-identical to the
+            # reference. ``MODEL_REPRO_GEMM_TN`` remains honoured so the behaviour
+            # can still be exercised while the flag is off.
+            _gemm_tn = (
+                getattr(self.config, "use_accuracy_compatible", False)
+                or os.environ.get("MODEL_REPRO_GEMM_TN", "0") == "1"
+            )
+            # Splitting per sequence-parallel shard needs row_owner, which the MoE
+            # layer only supplies when the same alignment is active there.
+            _shard_split = row_owner is not None
+            if _gemm_tn:
+                # E-114/E-107: mcore issues a TN GEMM (matmul(x, w.t()) on [out, in]
+                # storage). Reproduce per expert via paddle.matmul(x,
+                # w.t().contiguous(), transpose_y=True), which E-115 verified is
+                # bit-exact with torch.linear in both compat and default modes.
+                # E-107/E-115 second axis: mcore batches each expert's GEMM on the
+                # rank-local SP shard's tokens while paddle's permute output carries
+                # the union of all shards; bf16 GEMM rows are not M-invariant, so
+                # when MODEL_REPRO_MOE_SHARD_GEMM=1 we split each expert block by
+                # shard (row_owner) and run one TN fc1+fc2 chain per shard,
+                # re-concatenating in original row order.
+                _use_flinear = (
+                    os.environ.get("MODEL_REPRO_MOE_USE_FLINEAR", "0") == "1"
+                )
+                out_parts = []
+                _x_start = 0
+                for _e, _n in enumerate(tokens_per_expert):
+                    if _n == 0:
+                        continue
+                    _xb = permuted_local_hidden_states[
+                        _x_start : _x_start + _n
+                    ]
+                    _wt1 = self.weight1[_e].t().contiguous()
+                    _wt2 = self.weight2[_e].t().contiguous()
+                    _probs_blk = (
+                        permuted_probs[_x_start : _x_start + _n]
+                        if permuted_probs is not None
+                        else None
+                    )
+                    if _shard_split:
+                        _own = row_owner[_x_start : _x_start + _n]
+                        _sub = []
+                        _i0 = 0
+                        while _i0 < _n:
+                            _v = int(_own[_i0].item())
+                            _i1 = _i0
+                            while _i1 < _n and int(_own[_i1].item()) == _v:
+                                _i1 += 1
+                            _seg = _xb[_i0:_i1]
+                            if _use_flinear:
+                                _h = self.activation_func(
+                                    paddle.nn.functional.linear(_seg, self.weight1[_e])
+                                )
+                            else:
+                                _h = self.activation_func(
+                                    paddle.matmul(_seg, _wt1, transpose_y=True)
+                                )
+                            if _probs_blk is not None:
+                                _od = _h.dtype
+                                _h = (
+                                    _h * _probs_blk[_i0:_i1].unsqueeze(-1)
+                                ).to(_od)
+                            if _use_flinear:
+                                _h = paddle.nn.functional.linear(_h, self.weight2[_e])
+                            else:
+                                _h = paddle.matmul(_h, _wt2, transpose_y=True)
+                            _sub.append(_h)
+                            _i0 = _i1
+                        out_parts.append(paddle.concat(_sub, axis=0))
+                    else:
+                        if _use_flinear:
+                            _h = self.activation_func(
+                                paddle.nn.functional.linear(_xb, self.weight1[_e])
+                            )
+                        else:
+                            _h = self.activation_func(
+                                paddle.matmul(_xb, _wt1, transpose_y=True)
+                            )
+                        if _probs_blk is not None:
+                            _od = _h.dtype
+                            _h = (_h * _probs_blk.unsqueeze(-1)).to(_od)
+                        if _use_flinear:
+                            out_parts.append(
+                                paddle.nn.functional.linear(_h, self.weight2[_e])
+                            )
+                        else:
+                            out_parts.append(
+                                paddle.matmul(_h, _wt2, transpose_y=True)
+                            )
+                    _x_start += _n
+                fc2_output = paddle.concat(out_parts, axis=0)
+            elif self.moe_deep_gemm:
                 fc1_output = DeepGEMMBMMFunction.apply(
                     permuted_local_hidden_states,
                     self.weight1,
                     paddle.to_tensor(tokens_per_expert, dtype="int32"),
                 )
+                if self.activation_recompute:
+                    raise NotImplementedError(
+                        "Recompute in GroupedMLPExpert is not implemented"
+                    )
+                else:
+                    intermediate_parallel = self.activation_func(fc1_output)
+                    if permuted_probs is not None:
+                        _orig_dtype = intermediate_parallel.dtype
+                        intermediate_parallel = (
+                            intermediate_parallel * permuted_probs.unsqueeze(-1)
+                        )
+                        intermediate_parallel = intermediate_parallel.to(_orig_dtype)
+                        if os.environ.get("MODEL_REPRO_MOE_EXPERT_DUMP_DIR") and os.environ.get("MODEL_REPRO_MOE_UNPERM_EXPERT_ORDER", "0") == "1":
+                            import paddle.distributed as _ed2
+
+                            _er2 = _ed2.get_rank() if _ed2.is_initialized() else 0
+                            os.makedirs(
+                                os.environ["MODEL_REPRO_MOE_EXPERT_DUMP_DIR"], exist_ok=True
+                            )
+                            intermediate_parallel.detach().astype("float32").cpu().numpy().tofile(
+                                os.path.join(
+                                    os.environ["MODEL_REPRO_MOE_EXPERT_DUMP_DIR"],
+                                    f"paddle_act_probs_r{_er2}.f32.bin",
+                                )
+                            )
+                    fc2_output = DeepGEMMBMMFunction.apply(
+                        intermediate_parallel,
+                        self.weight2,
+                        paddle.to_tensor(tokens_per_expert, dtype="int32"),
+                    )
             else:
                 fc1_output = BMMFunction.apply(
                     permuted_local_hidden_states,
                     self.weight1,
                     tokens_per_expert,
                 )
-            if self.activation_recompute:
-                raise NotImplementedError(
-                    "Recompute in GroupedMLPExpert is not implemented"
-                )
-            else:
-                intermediate_parallel = self.activation_func(fc1_output)
-                if self.moe_deep_gemm:
-                    fc2_output = DeepGEMMBMMFunction.apply(
-                        intermediate_parallel,
-                        self.weight2,
-                        paddle.to_tensor(tokens_per_expert, dtype="int32"),
+                if self.activation_recompute:
+                    raise NotImplementedError(
+                        "Recompute in GroupedMLPExpert is not implemented"
                     )
                 else:
+                    intermediate_parallel = self.activation_func(fc1_output)
+                    if permuted_probs is not None:
+                        _orig_dtype = intermediate_parallel.dtype
+                        intermediate_parallel = (
+                            intermediate_parallel * permuted_probs.unsqueeze(-1)
+                        )
+                        intermediate_parallel = intermediate_parallel.to(_orig_dtype)
+                        if os.environ.get("MODEL_REPRO_MOE_EXPERT_DUMP_DIR") and os.environ.get("MODEL_REPRO_MOE_UNPERM_EXPERT_ORDER", "0") == "1":
+                            import paddle.distributed as _ed4
+
+                            _er4 = _ed4.get_rank() if _ed4.is_initialized() else 0
+                            os.makedirs(
+                                os.environ["MODEL_REPRO_MOE_EXPERT_DUMP_DIR"], exist_ok=True
+                            )
+                            intermediate_parallel.detach().astype("float32").cpu().numpy().tofile(
+                                os.path.join(
+                                    os.environ["MODEL_REPRO_MOE_EXPERT_DUMP_DIR"],
+                                    f"paddle_act_probs_r{_er4}.f32.bin",
+                                )
+                            )
                     fc2_output = BMMFunction.apply(
                         intermediate_parallel, self.weight2, tokens_per_expert
                     )
@@ -351,8 +504,25 @@ class GroupedMLPExpert(FleetLayer):
                 )
             else:
                 h = self.activation_func(h)
+                if permuted_probs is not None:
+                    _orig_dtype = h.dtype
+                    h = h * permuted_probs.unsqueeze(-1)
+                    h = h.to(_orig_dtype)
                 fc2_output = paddle.matmul(h, w2)
 
+        _expert_dump = os.environ.get("MODEL_REPRO_MOE_EXPERT_DUMP_DIR")
+        if _expert_dump:
+            import paddle.distributed as _pde
+
+            _erank = _pde.get_rank() if _pde.is_initialized() else 0
+            os.makedirs(_expert_dump, exist_ok=True)
+            fc2_output.detach().astype("float32").cpu().numpy().tofile(
+                os.path.join(_expert_dump, f"paddle_expert_rows_r{_erank}.f32.bin")
+            )
+            if row_owner is not None:
+                row_owner.detach().cpu().numpy().tofile(
+                    os.path.join(_expert_dump, f"paddle_expert_owner_r{_erank}.i64.bin")
+                )
         return fc2_output, None
 
     def backward_dw(self):

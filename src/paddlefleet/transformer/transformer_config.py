@@ -1153,6 +1153,9 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_types: list[str] | None = None
     """Optional per-layer DSA indexer layout (``full`` or ``shared``)."""
 
+    dsa_index_share_for_mtp_iteration: bool = False
+    """Whether MTP iterations reuse top-k indices from the final decoder layer."""
+
     dsa_indexer_loss_coeff: float | None = None
     """KL loss coefficient for DSA Indexer training. None disables the KL loss.
 
@@ -1399,6 +1402,7 @@ class TransformerConfig(ModelParallelConfig):
         "index_topk_freq": "dsa_indexer_topk_freq",
         "index_skip_topk_offset": "dsa_indexer_skip_topk_offset",
         "indexer_types": "dsa_indexer_types",
+        "index_share_for_mtp_iteration": "dsa_index_share_for_mtp_iteration",
         "indexer_loss_coeff": "dsa_indexer_loss_coeff",
         "indexer_use_sparse_loss": "dsa_indexer_use_sparse_loss",
         "indexer_rotary_interleaved": "dsa_indexer_rotary_interleaved",

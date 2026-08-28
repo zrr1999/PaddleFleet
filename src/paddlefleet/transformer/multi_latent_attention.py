@@ -185,6 +185,56 @@ def build_hysparse_valid_range(
     return valid_range.contiguous()
 
 
+_ACCURACY_COMPATIBLE_KERNEL: bool = (
+    os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
+)
+# Dedicated env for the torch-aligned absorbed-MLA core (rounds 10-13): lets the
+# absorbed branch run WITHOUT the engine-wide FLAGS_* acc flag (which would
+# re-route the whole network's kernels away from the bit-exact path).
+_DSA_ABSORBED: bool = (
+    os.environ.get("MODEL_REPRO_DSA_ABSORBED", "0") == "1"
+) or _ACCURACY_COMPATIBLE_KERNEL
+
+
+def _accuracy_compatible_q_down_projection(projection, hidden_states):
+    """Apply q-down with the Torch-aligned strided-transpose GEMM formulation.
+
+    Candidate repro alignment (E-062): replicate the fused ColumnParallelLinear
+    semantics at any TP size: if sequence-parallel, all-gather the sequence first
+    (the fused linear does this internally), then F.linear on the local weight
+    shard; the caller's gather/scatter then produces the TP/SP-correct tensors.
+
+    Note that a REPLICATED ``Linear`` never takes the gather branch: it does not
+    set ``sequence_parallel`` on itself and does not keep a ``tp_group``, so this
+    reduces to ``F.linear`` on the local sequence shard. That is the intended
+    behaviour and matches Megatron-Core's ``Linear`` case, whose comment at
+    ``absorbed_mla.py:454-455`` reads ``q_compressed: [s / TP, b, q_lora_rank]``
+    -- the sequence stays sharded and the weight gradient is therefore a partial
+    sum that ``Linear`` marks for the TP all-reduce.
+    """
+    output_bias = projection.bias if projection.skip_bias_add else None
+    bias = None if projection.skip_bias_add else projection.bias
+    # Use ``get_pg_size`` rather than reading ``tp_group.world_size``: it is the
+    # idiom used everywhere else in this module, it already returns 1 for a None
+    # or single-rank group, and it does not require the caller to hold a real
+    # process group just to evaluate the guard.
+    if (
+        getattr(projection, "sequence_parallel", False)
+        and get_pg_size(getattr(projection, "tp_group", None)) > 1
+    ):
+        from paddlefleet.tensor_parallel.mappings import (
+            gather_from_sequence_parallel_region,
+        )
+
+        hidden_states = gather_from_sequence_parallel_region(
+            hidden_states, group=projection.tp_group
+        )
+        hidden_states = hidden_states.contiguous()
+    output = paddle.nn.functional.linear(hidden_states, projection.weight, bias)
+    return output, output_bias
+
+
+
 def _ec_compatible_rope_apply(
     q_pe,
     k_pe,
@@ -963,6 +1013,7 @@ class MultiLatentAttention(Attention):
         core_attn_extra = {}
         if self.mqa_latent and kwargs.get("input_ids") is not None:
             core_attn_extra["input_ids"] = kwargs["input_ids"]
+        k_abs_weight = None
 
         if self.mqa_latent:
             # Query is already absorbed; the core attention only needs the V-side
@@ -989,6 +1040,27 @@ class MultiLatentAttention(Attention):
                         -1,
                     ]
                 )[:, :, self.qk_nope_head_dim :]
+        elif _DSA_ABSORBED:
+            import sys as _sys
+            import os as _os
+            if _os.environ.get("MINI_ABS_DEBUG") == "1":
+                print(f"[repro-e063] absorbed branch ACTIVE layer={self.layer_number}",
+                      file=_sys.stderr, flush=True)
+            # E-063 repro candidate: torch-aligned ABSORBED core. The DSA core
+            # builds q_absorbed from its own query (pre-rope nope + roped rope)
+            # with these K/V de-absorption weights; the core then scores in the
+            # latent 576-space and applies the wv einsum. Mirrors the mcore
+            # AbsorbedMLASelfAttention pipeline.
+            kv_b_w = self.kv_b_proj.weight  # [kv_lora, heads*(qk_nope+v_head)]
+            w_h = kv_b_w.reshape(
+                [self.kv_lora_rank, self.num_attention_heads_per_partition, -1]
+            ).transpose([1, 2, 0])  # [h, per-head rows, kv_lora]
+            k_abs_weight = w_h[:, : self.qk_nope_head_dim, :]  # [h, qk_nope, kv_lora]
+            # E-088: keep the torch operand layout [h, v_head_dim, kv_lora] so the
+            # de-absorption einsum matches mcore's einsum("sbhc,hdc->sbhd") exactly
+            # (contraction over the trailing kv_lora axis of BOTH operands).
+            wv_b = w_h[:, -self.v_head_dim:, :]  # [h, v, kv_lora]
+            q_absorbed = None  # built inside the core from its own query
         elif hasattr(self.core_attention.config, "forward_meta"):  # decode mode
             # Compute absorbed query and V de-absorption weight for FD MLA decode kernel
             # q_absorbed: [b, s, heads, kv_lora_rank + qk_rope_head_dim]
@@ -1069,6 +1141,7 @@ class MultiLatentAttention(Attention):
                 k_pos_emb=k_pos_emb,
                 q_absorbed=q_absorbed,
                 v_b_proj_weight=wv_b,
+                k_abs_weight=k_abs_weight,
                 **core_attn_extra,
             )
         else:
@@ -1095,6 +1168,7 @@ class MultiLatentAttention(Attention):
                 k_pos_emb=k_pos_emb,
                 q_absorbed=q_absorbed,
                 v_b_proj_weight=wv_b,
+                k_abs_weight=k_abs_weight,
                 **core_attn_extra,
             )
 
@@ -1730,6 +1804,51 @@ class MLASelfAttention(MultiLatentAttention):
                 # mscale is already accounted for in self.softmax_scale; set to 1.0 to avoid double-applying
                 # mscale = 1.0
 
+        if self.is_mtp_layer and getattr(
+            self.config, "use_accuracy_compatible", False
+        ):
+            # E-225: an MTP layer must rotate by the position it PREDICTS.
+            #
+            # An MTP layer at depth d predicts token t + d + 1, so its row p carries
+            # real position p + d + 1 and has to be rotated by that angle. The
+            # reference does exactly that by rolling the table along the sequence
+            # axis by the MTP depth (mcore_bridge model/modules/mtp_layer.py:109,
+            # ``torch.roll(rotary_pos_emb, shifts=-layer_number, dims=0)`` with an
+            # MTP-local ``layer_number`` starting at 1). It is the rope counterpart of
+            # the input/label roll that ``roll_tensor`` already performs.
+            #
+            # Nothing rolled it here. ``multi_token_prediction.py:1222-1231`` only
+            # TRIMS an incoming table, and on this path there is no incoming table at
+            # all: E-220 measured ``rotary_pos_emb=None`` in the MTP layer input dict,
+            # so that trim is dead code and the table is rebuilt above from a plain
+            # ``paddle.arange`` (``position_ids`` is discarded while training, see the
+            # call above). Row p therefore encoded position p instead of p + d + 1 and
+            # every MTP query and key was rotated by the angle of the wrong position.
+            #
+            # A plain wrap-around roll reproduces the reference bit for bit: the
+            # vacated tail receives row 0, which is the zero row (identity rotation)
+            # for an arange-based table. E-225 confirmed 59/59 rows and 1888/1888
+            # float32 elements equal under exactly this one-position roll.
+            #
+            # Why the residual it leaves behind matched the observation: rotating a
+            # query and a key at the SAME position by the same angle leaves their dot
+            # product unchanged, so a row that attends only to itself cannot move.
+            # rank2 row 0 -- the only self-only row -- was the one bit-identical row,
+            # while rows 1..29 all differed.
+            _mtp_rope_shift = -(self.layer_number + 1)
+            if rotary_pos_emb is not None:
+                rotary_pos_emb = paddle.roll(
+                    rotary_pos_emb, shifts=_mtp_rope_shift, axis=1
+                )
+            if rotary_pos_cos is not None:
+                rotary_pos_cos = paddle.roll(
+                    rotary_pos_cos, shifts=_mtp_rope_shift, axis=1
+                )
+            if rotary_pos_sin is not None:
+                rotary_pos_sin = paddle.roll(
+                    rotary_pos_sin, shifts=_mtp_rope_shift, axis=1
+                )
+
         cp_size = get_context_parallel_world_size()
         if cp_size > 1:
             # Keep RoPE inputs local to the current CP rank before the fused
@@ -1813,7 +1932,17 @@ class MLASelfAttention(MultiLatentAttention):
         if self.q_lora_rank is not None:
             # if q_a_proj is ColumnParallelLinear:
             #     q_compressed: [b, s, q_lora_rank / TP]
-            q_compressed, _ = self.q_a_proj(hidden_states)
+            if (
+                _ACCURACY_COMPATIBLE_KERNEL
+                # E-062 repro candidate: allow the torch-aligned strided-transpose
+                # GEMM at any TP size (was: and get_pg_size(self.pg_collection.tp) == 1);
+                # _accuracy_compatible_q_down_projection now replicates the SP gather.
+            ):
+                q_compressed, _ = _accuracy_compatible_q_down_projection(
+                    self.q_a_proj, hidden_states
+                )
+            else:
+                q_compressed, _ = self.q_a_proj(hidden_states)
 
             # When output is sharded (ColumnParallelLinear):
             # Gather output to restore output dim q_lora_rank;

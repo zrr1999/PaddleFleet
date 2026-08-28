@@ -205,6 +205,15 @@ class MoELayer(nn.Layer):
             self.fp8_dispatch and self.using_sonic_moe and self.fp8_wgrad
         )
         self.moe_expert_fusion = config.moe_expert_fusion
+        import os as _os
+
+        if _os.environ.get("MODEL_REPRO_MOE_FUSION", "0") == "1":
+            print(
+                f"[MOE-FUSION-DEBUG] MoELayer init moe_expert_fusion={self.moe_expert_fusion} "
+                f"ep={getattr(self, 'expert_model_parallel_size', None)} "
+                f"dispatch={getattr(self, 'moe_token_dispatcher_type', None)}",
+                flush=True,
+            )
         if self.hidden_act == situ and (
             config.moe_use_fusion_node or self.moe_expert_fusion
         ):
@@ -450,8 +459,24 @@ class MoELayer(nn.Layer):
             self.moe_shared_expert_intermediate_size
         )
         shared_expert_args["is_expert"] = False
+        if (
+            os.environ.get("MODEL_REPRO_MOE_SHARED_TP", "0") == "1"
+            and self.pg_collection is not None
+        ):
+            # E-127: mcore's SharedExpertMLP is a TP-split MLP (linear_fc1 column
+            # parallel over TP, linear_fc2 row parallel + allreduce), while
+            # PaddleFleet's default shared expert keeps full per-rank weights.
+            # The bf16 GEMM over the full N vs half-N+reduce differ by 1 ULP per
+            # output after downstream combine (~8k/184320 at layer3). Restore the
+            # TP-split structure (weights load through the same TP splitter as
+            # dense MLPs).
+            shared_expert_args["tp_group"] = self.pg_collection.tp
         if self.n_shared_experts > 0:
             self.shared_experts = self.shared_expert_class(**shared_expert_args)
+            try:
+                self.shared_experts._shared_layer_no = str(getattr(self, "layer_number", "-"))
+            except Exception:
+                pass
         else:
             self.shared_experts = None
 
@@ -1307,9 +1332,14 @@ class MoELayer(nn.Layer):
             output: Shape: [batch_size, seq_len, hidden_size]
         """
         if self.expert_model_parallel_size <= 1 and self.sequence_parallel:
-            hidden_states = GatherOp.apply(hidden_states)
-            if residual is not None:
-                residual = GatherOp.apply(residual)
+            _moe_no_gather = os.environ.get("MODEL_REPRO_MOE_NO_GATHER", "0") == "1"
+            self._repro_moe_no_gather = _moe_no_gather
+            if not _moe_no_gather:
+                hidden_states = GatherOp.apply(hidden_states)
+                if residual is not None:
+                    residual = GatherOp.apply(residual)
+        else:
+            self._repro_moe_no_gather = False
 
         orig_shape = hidden_states.shape
         residuals = hidden_states
@@ -1329,6 +1359,16 @@ class MoELayer(nn.Layer):
         else:
             _hs_router_path = _hs_dispatcher_path = hidden_states
         _log_moe_md5(hidden_states, "moe_input", layer_idx)
+        if os.environ.get("MODEL_REPRO_MOE_STEP_MD5", "0") == "1":
+            import paddle.distributed as _pdmd5
+
+            _mr = _pdmd5.get_rank() if _pdmd5.is_initialized() else 0
+            import hashlib as _hb
+
+            _h = hashlib.md5(
+                hidden_states.detach().cast("float32").numpy().tobytes()
+            ).hexdigest()
+            print(f"[MOE-STEP-MD5] r{_mr} layer{layer_idx} hidden {tuple(hidden_states.shape)} md5 {_h}", flush=True)
 
         self._maybe_pre_allgather_overlap(hidden_states)
         gate_input = self._prepare_gate_input(_hs_router_path, residual)
@@ -1354,6 +1394,45 @@ class MoELayer(nn.Layer):
 
         _log_moe_md5(probs, "probs", layer_idx)
         _log_moe_md5(mask, "routing_mask", layer_idx)
+        _router_dump_dir = os.environ.get("MODEL_REPRO_MOE_ROUTER_DUMP_DIR")
+        if _router_dump_dir and not getattr(
+            MoELayer.forward, "_repro_router_dumped", False
+        ):
+            MoELayer.forward._repro_router_dumped = True
+            import paddle.distributed as _pd
+
+            _rank = _pd.get_rank() if _pd.is_initialized() else 0
+            os.makedirs(_router_dump_dir, exist_ok=True)
+            try:
+                paddle_router_input_r = gate_input if "gate_input" in dir() else hidden_states
+                paddle_router_input_r.detach().astype("float32").cpu().numpy().tofile(
+                    os.path.join(_router_dump_dir, f"paddle_router_input_r{_rank}.f32.bin")
+                )
+            except Exception:
+                pass
+            probs.detach().astype("float32").cpu().numpy().tofile(
+                os.path.join(_router_dump_dir, f"paddle_router_probs_r{_rank}.f32.bin")
+            )
+            mask.detach().astype("uint8").cpu().numpy().tofile(
+                os.path.join(_router_dump_dir, f"paddle_routing_map_r{_rank}.u8.bin")
+            )
+            topk_weights.detach().astype("float32").cpu().numpy().tofile(
+                os.path.join(_router_dump_dir, f"paddle_topk_weights_r{_rank}.f32.bin")
+            )
+            topk_indices.detach().astype("int32").cpu().numpy().tofile(
+                os.path.join(_router_dump_dir, f"paddle_topk_indices_r{_rank}.i32.bin")
+            )
+            with open(
+                os.path.join(_router_dump_dir, f"paddle_router_shapes_r{_rank}.txt"), "w"
+            ) as _f:
+                _f.write(f"probs={tuple(probs.shape)} dtype={probs.dtype}\n")
+                _f.write(f"mask={tuple(mask.shape)} dtype={mask.dtype}\n")
+                _f.write(
+                    f"topk_weights={tuple(topk_weights.shape)} dtype={topk_weights.dtype}\n"
+                )
+                _f.write(
+                    f"topk_indices={tuple(topk_indices.shape)} dtype={topk_indices.dtype}\n"
+                )
         if framework._dygraph_tracer()._has_grad:
             log_moe_losses(layer_idx, aux_loss=aux_loss, z_loss=z_loss)
 
@@ -1399,10 +1478,14 @@ class MoELayer(nn.Layer):
             if self.use_latent_moe:
                 reshaped_input = self.fc1_latent_proj(reshaped_input)
             if self.moe_expert_fusion:
+                if os.environ.get("MODEL_REPRO_MOE_FUSION", "0") == "1":
+                    print("[MOE-FUSION-DEBUG] forward takes BRANCH-B (grouped)", flush=True)
                 output = self._forward_single_card_grouped_gemm_moe(
                     reshaped_input, mask, probs, topk_indices, topk_weights
                 )
             else:
+                if os.environ.get("MODEL_REPRO_MOE_FUSION", "0") == "1":
+                    print("[MOE-FUSION-DEBUG] forward takes BRANCH-C", flush=True)
                 output = self._forward_single_card_moe(
                     reshaped_input, topk_indices, topk_weights
                 )
@@ -1413,6 +1496,18 @@ class MoELayer(nn.Layer):
                 output = self.fc2_latent_proj(output)
 
         _log_moe_md5(output, "moe_routed_output", layer_idx)
+        _moe_ds_dump = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR")
+        if _moe_ds_dump:
+            import paddle.distributed as _pd3
+
+            _dsrank = _pd3.get_rank() if _pd3.is_initialized() else 0
+            os.makedirs(_moe_ds_dump, exist_ok=True)
+            output.detach().astype("float32").cpu().numpy().tofile(
+                os.path.join(
+                    _moe_ds_dump,
+                    f"paddle_moe_routed_output_l{layer_idx}_r{_dsrank}.f32.bin",
+                )
+            )
 
         if self.training and self.router_aux_loss_coef and aux_loss is not None:
             aux_loss = aux_loss * float(self.router_aux_loss_coef)
@@ -1430,12 +1525,52 @@ class MoELayer(nn.Layer):
             else:
                 shared_output = self.shared_experts(residuals)[0]
             shared_output = self._post_shared_output(shared_output)
+            _moe_ds_dump2 = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR")
+            if _moe_ds_dump2:
+                import paddle.distributed as _pd4b
+
+                _dsrank2b = _pd4b.get_rank() if _pd4b.is_initialized() else 0
+                os.makedirs(_moe_ds_dump2, exist_ok=True)
+                residuals.detach().astype("float32").cpu().numpy().tofile(
+                    os.path.join(
+                        _moe_ds_dump2,
+                        f"paddle_shared_input_l{layer_idx}_r{_dsrank2b}.f32.bin",
+                    )
+                )
+                if hasattr(self.shared_experts, "up_gate_proj"):
+                    _w1 = self.shared_experts.up_gate_proj.weight
+                    _w2 = self.shared_experts.down_proj.weight
+                    _w1.detach().astype("float32").cpu().numpy().tofile(
+                        os.path.join(_moe_ds_dump2, f"paddle_shared_w1_r{_dsrank2b}.f32.bin")
+                    )
+                    _w2.detach().astype("float32").cpu().numpy().tofile(
+                        os.path.join(_moe_ds_dump2, f"paddle_shared_w2_r{_dsrank2b}.f32.bin")
+                    )
+                shared_output.detach().astype("float32").cpu().numpy().tofile(
+                    os.path.join(
+                        _moe_ds_dump2,
+                        f"paddle_moe_shared_output_l{layer_idx}_r{_dsrank2b}.f32.bin",
+                    )
+                )
             output = output + shared_output
 
         _log_moe_md5(output, "moe_final_output", layer_idx)
+        if _moe_ds_dump:
+            import paddle.distributed as _pd4
+
+            _dsrank2 = _pd4.get_rank() if _pd4.is_initialized() else 0
+            os.makedirs(_moe_ds_dump, exist_ok=True)
+            _step_tag = os.environ.get("TRAINER_GLOBAL_STEP", "x")
+            output.detach().astype("float32").cpu().numpy().tofile(
+                os.path.join(
+                    _moe_ds_dump,
+                    f"paddle_moe_final_output_l{layer_idx}_s{_step_tag}_r{_dsrank2}.f32.bin",
+                )
+            )
 
         if self.expert_model_parallel_size <= 1 and self.sequence_parallel:
-            output = ScatterOp.apply(output)
+            if not getattr(self, "_repro_moe_no_gather", False):
+                output = ScatterOp.apply(output)
         return output, None  # None is bias
 
     def _forward_single_card_moe(
@@ -1457,8 +1592,13 @@ class MoELayer(nn.Layer):
         """
 
         _, d_model = hidden_states.shape
+        _fp32_combine = os.environ.get("MODEL_REPRO_MOE_FP32_COMBINE", "0") == "1"
+        _prescale_combine = (
+            os.environ.get("MODEL_REPRO_MOE_PRESCALE_COMBINE", "0") == "1"
+        )
         final_hidden_states = paddle.zeros_like(
-            hidden_states, dtype=hidden_states.dtype
+            hidden_states,
+            dtype="float32" if _fp32_combine else hidden_states.dtype,
         )
 
         # One hot encode the selected experts to create an expert mask
@@ -1479,9 +1619,46 @@ class MoELayer(nn.Layer):
             if tokens_per_expert[expert_idx] <= 0.1:
                 continue
             current_state = hidden_states[idx, None].reshape([-1, d_model])
-            expert_out = expert_layer(current_state)[0]
             current_weight = topk_weights[idx, top_x].unsqueeze(-1)
-            current_hidden_states = expert_out * current_weight
+            if _prescale_combine:
+                # E-112 probe: mcore folds the routing probability into the
+                # ACTIVATION before fc2 (Megatron experts.py:783-788), whereas the
+                # default paddle path multiplies expert_out AFTER fc2. The two are
+                # algebraically identical but round differently in bf16. Pass the
+                # weight down as per_token_scale so MLP.forward applies it in the
+                # mcore position, and skip the post-fc2 multiply here.
+                expert_out = expert_layer(current_state, per_token_scale=current_weight)[0]
+                if _fp32_combine:
+                    # E-113 probe: prescale (mcore multiply position) PLUS fp32
+                    # accumulation of the already-weighted expert contributions.
+                    final_hidden_states_tmp = paddle.zeros_like(final_hidden_states)
+                    final_hidden_states_tmp = paddle.scatter(
+                        final_hidden_states_tmp,
+                        idx.reshape([-1]),
+                        expert_out.cast("float32"),
+                        overwrite=False,
+                    )
+                    final_hidden_states = final_hidden_states + final_hidden_states_tmp
+                    continue
+                current_hidden_states = expert_out
+            else:
+                expert_out = expert_layer(current_state)[0]
+                if _fp32_combine:
+                    # E-099 probe: accumulate the weighted expert contributions in fp32
+                    # (mirrors mcore's fp32 unpermute/combine) instead of bf16.
+                    current_hidden_states = expert_out.cast("float32") * current_weight.cast(
+                        "float32"
+                    )
+                    final_hidden_states_tmp = paddle.zeros_like(final_hidden_states)
+                    final_hidden_states_tmp = paddle.scatter(
+                        final_hidden_states_tmp,
+                        idx.reshape([-1]),
+                        current_hidden_states,
+                        overwrite=False,
+                    )
+                    final_hidden_states = final_hidden_states + final_hidden_states_tmp
+                    continue
+                current_hidden_states = expert_out * current_weight
 
             # use scatter to replace index_add
             final_hidden_states_tmp = paddle.zeros_like(final_hidden_states)
@@ -1533,20 +1710,365 @@ class MoELayer(nn.Layer):
             )
             return final_hidden_states.cast(hidden_states.dtype)
         else:
+            # E-118: LOCAL-SHARD mode. mcore runs the routed experts on the
+            # rank-local SP shard (token slice of this TP rank) and never gathers
+            # for the experts; paddle's wrapper gathers to 60 and would run the
+            # union, which changes every per-expert GEMM M and (for bf16) the row
+            # results. Here we run permute/GEMM/unpermute on the LOCAL slice and
+            # place the result back at this rank's slot; router/shared still use
+            # the gathered 60 (matching mcore's shared-expert allgather semantics).
+            # Accuracy-compatible expert path (E-163 / E-256). These behaviours
+            # are what make the routed-expert block bit-identical to Megatron-LM;
+            # they are enabled together by ``config.use_accuracy_compatible`` and
+            # are not independent tuning knobs.
+            #
+            #   _use_ac            permute/unpermute use the MG-aligned
+            #                      gather/sum PyLayers (fp32 topk reduction).
+            #                      Previously this was gated only on
+            #                      MODEL_REPRO_MOE_AC_ALIGNED, so the formal
+            #                      accuracy-compatible path still ran default
+            #                      index_select / scatter unpermute.
+            #   _prescale_combine  fold the routing probs into the post-GLU
+            #                      activation BEFORE fc2 (Megatron
+            #                      moe/experts.py:786-788) and unpermute without
+            #                      probs, instead of scaling after fc2.
+            #   _shard_gemm        batch each expert's GEMM per sequence-parallel
+            #                      shard, matching the M that mcore's per-rank
+            #                      expert calls see.
+            #
+            # ``MODEL_REPRO_MOE_AC_ALIGNED`` / ``MODEL_REPRO_MOE_PRESCALE_COMBINE``
+            # / ``MODEL_REPRO_MOE_SHARD_GEMM`` remain honoured so the behaviours
+            # can still be exercised in isolation while the flag is off.
+            _ac_expert_path = getattr(self.config, "use_accuracy_compatible", False)
+            _use_ac = (
+                _ac_expert_path
+                or os.environ.get("MODEL_REPRO_MOE_AC_ALIGNED", "0") == "1"
+            )
+            _prescale_combine = (
+                _ac_expert_path
+                or os.environ.get("MODEL_REPRO_MOE_PRESCALE_COMBINE", "0") == "1"
+            )
+            _shard_gemm = (
+                _ac_expert_path
+                or os.environ.get("MODEL_REPRO_MOE_SHARD_GEMM", "0") == "1"
+            )
+            # LOCAL_SHARD remains an explicit env gate only. Enabling it from
+            # use_accuracy_compatible (tried in E-256) sliced expert wgrad to
+            # the local 30-token SP shard and broke rank2==rank3 equality that
+            # mcore keeps (expert weights are not sequence-parallel). Permute
+            # on the gathered 60 plus per-shard GEMM (_shard_gemm) is the
+            # accuracy-compatible path.
+            if (
+                os.environ.get("MODEL_REPRO_MOE_LOCAL_SHARD", "0") == "1"
+                and self.sequence_parallel
+                and self.pg_collection is not None
+            ):
+                from paddlefleet import utils as _pfutils
+
+                _tp_size = max(_pfutils.get_pg_size(self.pg_collection.tp), 1)
+                _tp_rank = _pfutils.get_pg_rank(self.pg_collection.tp)
+                _n_tok = hidden_states.shape[0]
+                _slen = _n_tok // _tp_size
+                _lo, _hi = _tp_rank * _slen, (_tp_rank + 1) * _slen
+                _hs_loc = hidden_states[_lo:_hi]
+                _rm_loc = routing_map[_lo:_hi]
+                _pr_loc = probs[_lo:_hi] if probs is not None else None
+                _tpe_loc = _rm_loc.sum(axis=0)
+                if os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1":
+                    import paddle.distributed as _hld
+                    _hlk = _hld.get_rank() if _hld.is_initialized() else 0
+                    _hdir = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR") or ""
+                    if _hdir:
+                        os.makedirs(_hdir, exist_ok=True)
+                        _hs_loc.detach().astype("float32").cpu().numpy().tofile(
+                            os.path.join(_hdir, f"paddle_hs_loc_r{_hlk}.f32.bin")
+                        )
+                _perm_loc, _sorted_loc = permute(
+                    _hs_loc, _rm_loc, _tpe_loc, use_accuracy_compatible=_use_ac
+                )
+                if os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1":
+                    import paddle.distributed as _ppd
+                    _ppk = _ppd.get_rank() if _ppd.is_initialized() else 0
+                    _ppdir = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR") or ""
+                    _pplay = getattr(self, "layer_number", None)
+                    if _ppdir:
+                        os.makedirs(_ppdir, exist_ok=True)
+                        _perm_loc.detach().astype("float32").cpu().numpy().tofile(
+                            os.path.join(_ppdir, f"paddle_perm_loc_l{_pplay}_r{_ppk}.f32.bin")
+                        )
+                        _sorted_loc.detach().cpu().numpy().tofile(
+                            os.path.join(_ppdir, f"paddle_sorted_loc_l{_pplay}_r{_ppk}.i64.bin")
+                        )
+                _pp_loc = None
+                if _pr_loc is not None:
+                    _pp_loc = _pr_loc.T.contiguous().masked_select(
+                        _rm_loc.T.contiguous().cast("bool")
+                    )
+                if os.environ.get("MODEL_REPRO_MOE_EXPERT_DUMP_DIR"):
+                    import paddle.distributed as _pdl2
+
+                    _dc = _pdl2.get_rank() if _pdl2.is_initialized() else 0
+                    os.makedirs(
+                        os.environ["MODEL_REPRO_MOE_EXPERT_DUMP_DIR"], exist_ok=True
+                    )
+                    _tpe_loc.detach().cpu().numpy().tofile(
+                        os.path.join(
+                            os.environ["MODEL_REPRO_MOE_EXPERT_DUMP_DIR"],
+                            f"local_tpe_r{_dc}.i64.bin",
+                        )
+                    )
+                    _pr_loc.detach().astype("float32").cpu().numpy().tofile(
+                        os.path.join(
+                            os.environ["MODEL_REPRO_MOE_EXPERT_DUMP_DIR"],
+                            f"local_probs_r{_dc}.f32.bin",
+                        )
+                    )
+                    _rm_np = _rm_loc.detach().cpu().numpy()
+                    print(
+                        f"[LOCAL-SHARD-DEBUG] r{_dc} tpe={_tpe_loc.detach().cpu().tolist()} "
+                        f"rm_np_dtype={_rm_np.dtype} shape={_rm_np.shape} "
+                        f"nonzero={int((_rm_np != 0).sum())} "
+                        f"probs_dtype={_pr_loc.dtype} pp_dtype={None if _pp_loc is None else _pp_loc.dtype} "
+                        f"pp_first={None if _pp_loc is None else _pp_loc.detach().cast('float32').cpu().numpy()[:4].tolist()}",
+                        flush=True,
+                    )
+                if os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_FORCE", "0") == "1":
+                    # E-171: bypass the fused/grouped GEMM and run a plain
+                    # per-expert matmul pipeline (fc1 bf16 -> silu -> *probs ->
+                    # fc2 bf16) so the kernel differences of the fused group
+                    # GEMM are excluded from the cross-frame diff compare.
+                    import paddle.nn.functional as _pf
+
+                    _exps = self.grouped_gemm_experts
+                    _w1 = _exps.weight1  # [E, H, 2*inter]
+                    _w2 = _exps.weight2  # [E, 2*inter? , H]
+                    _rows = []
+                    _tpe_i32 = _tpe_loc.astype("int32")
+                    _starts = paddle.cumsum(paddle.concat([paddle.zeros([1], dtype="int32"), _tpe_i32], 0), 0)
+                    for _e in range(int(_tpe_loc.shape[0])):
+                        _m = int(_tpe_loc[_e])
+                        if _m == 0:
+                            continue
+                        _seg = _perm_loc[_starts[_e] : _starts[_e + 1]]
+                        if os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1":
+                            import paddle.distributed as _ped
+                            _perk = _ped.get_rank() if _ped.is_initialized() else 0
+                            _pdir = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR") or os.environ.get("MODEL_REPRO_MOE_EXPERT_DUMP_DIR")
+                            if _pdir:
+                                os.makedirs(_pdir, exist_ok=True)
+                                _seg.detach().astype("float32").cpu().numpy().tofile(
+                                    os.path.join(_pdir, f"paddle_fc1_in_e{_e}_r{_perk}.f32.bin")
+                                )
+                        _h1 = _pf.linear(_seg, _w1[_e])
+                        if os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1":
+                            import paddle.distributed as _pe
+                            _per = _pe.get_rank() if _pe.is_initialized() else 0
+                            _dir = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR") or os.environ.get("MODEL_REPRO_MOE_EXPERT_DUMP_DIR")
+                            _play = getattr(self, "layer_number", None)
+                            if _dir:
+                                os.makedirs(_dir, exist_ok=True)
+                                _h1.detach().astype("float32").cpu().numpy().tofile(
+                                    os.path.join(_dir, f"paddle_fc1_raw_l{_play}_e{_e}_r{_per}.f32.bin")
+                                )
+                        _g, _l = paddle.chunk(_h1, 2, axis=-1)
+                        if os.environ.get("MODEL_REPRO_MOE_GLU_EXPLICIT", "0") == "1":
+                            # E-184: torch F.silu == fp32 silu then cast bf16
+                            # (verified 0 diff). Compute silu in fp32, cast bf16,
+                            # then bf16 multiply with _l (matches torch order).
+                            _act = (
+                                _g.cast("float32")
+                                * paddle.nn.functional.sigmoid(_g.cast("float32"))
+                            ).cast("bfloat16") * _l
+                        else:
+                            _act = paddle.nn.functional.silu(_g) * _l
+                        if os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1":
+                            import paddle.distributed as _gld2
+                            _glr2 = _gld2.get_rank() if _gld2.is_initialized() else 0
+                            _gldir2 = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR") or ""
+                            _gll2 = getattr(self, "layer_number", None)
+                            if _gldir2:
+                                os.makedirs(_gldir2, exist_ok=True)
+                                _act.detach().astype("float32").cpu().numpy().tofile(
+                                    os.path.join(_gldir2, f"paddle_gluout_l{_gll2}_e{_e}_r{_glr2}.f32.bin")
+                                )
+                        if _pp_loc is not None:
+                            if os.environ.get("MODEL_REPRO_MOE_PP_MUL_TORCH", "0") == "1":
+                                # torch: act(bf16)*probs(f32) -> f32 -> cast bf16
+                                _act = (
+                                    _act.cast("float32")
+                                    * _pp_loc[_starts[_e] : _starts[_e + 1]].unsqueeze(-1)
+                                ).cast("bfloat16")
+                            else:
+                                if os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1" and not getattr(
+                                    MoELayer, "_ppdtype_dbg", False
+                                ):
+                                    MoELayer._ppdtype_dbg = True
+                                    _ppseg = _pp_loc[_starts[_e] : _starts[_e + 1]].unsqueeze(-1)
+                                    print(
+                                        f"[PPDBG] _act.dtype={_act.dtype} _pp.dtype={_ppseg.dtype} "
+                                        f"_pr.dtype={_pr_loc.dtype if _pr_loc is not None else None}",
+                                        flush=True,
+                                    )
+                                _act = _act * _pp_loc[_starts[_e] : _starts[_e + 1]].unsqueeze(-1)
+                                if os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1" and not getattr(
+                                    MoELayer, "_ppres_dbg", False
+                                ):
+                                    MoELayer._ppres_dbg = True
+                                    print(f"[PPRESDBG] after-mul _act.dtype={_act.dtype} shape={tuple(_act.shape)}", flush=True)
+                        if os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1":
+                            import paddle.distributed as _acd
+                            _acr = _acd.get_rank() if _acd.is_initialized() else 0
+                            _acdir = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR") or ""
+                            _aclay = getattr(self, "layer_number", None)
+                            if _acdir:
+                                os.makedirs(_acdir, exist_ok=True)
+                                _act.detach().astype("float32").cpu().numpy().tofile(
+                                    os.path.join(_acdir, f"paddle_act_l{_aclay}_e{_e}_r{_acr}.f32.bin")
+                                )
+                        _h1_act = _act
+                        _h2 = _pf.linear(_act, _w2[_e])
+                        _h2 = paddle.nn.functional.linear(_act, _w2[_e])
+                        if os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1":
+                            import paddle.distributed as _f2d
+                            _f2r = _f2d.get_rank() if _f2d.is_initialized() else 0
+                            _f2dir = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR") or ""
+                            _f2l = getattr(self, "layer_number", None)
+                            if _f2dir:
+                                os.makedirs(_f2dir, exist_ok=True)
+                                _h2.detach().astype("float32").cpu().numpy().tofile(
+                                    os.path.join(_f2dir, f"paddle_fc2out_l{_f2l}_e{_e}_r{_f2r}.f32.bin")
+                                )
+                        _rows.append(_h2)
+                    _out_expert = paddle.concat(_rows, axis=0) if _rows else paddle.zeros(
+                        [0, self.hidden_size], dtype=_perm_loc.dtype
+                    )
+                else:
+                    _out_expert = self.grouped_gemm_experts(
+                        _perm_loc, _tpe_loc, permuted_probs=_pp_loc
+                    )[0]
+                if os.environ.get("MODEL_REPRO_MOE_EXPERT_DUMP_DIR") and os.environ.get("MODEL_REPRO_MOE_UNPERM_EXPERT_ORDER", "0") == "1":
+                    import paddle.distributed as _pdl3
+
+                    _dc3 = _pdl3.get_rank() if _pdl3.is_initialized() else 0
+                    _out_expert.detach().astype("float32").cpu().numpy().tofile(
+                        os.path.join(
+                            os.environ["MODEL_REPRO_MOE_EXPERT_DUMP_DIR"],
+                            f"weighted_expert_rows_r{_dc3}.f32.bin",
+                        )
+                    )
+                _out_final = unpermute(
+                    _out_expert,
+                    _sorted_loc,
+                    restore_shape=[_slen, self.hidden_size],
+                    probs=None,
+                    routing_map=_rm_loc if _use_ac else None,
+                    use_accuracy_compatible=_use_ac,
+                )
+                if os.environ.get("MODEL_REPRO_MOE_UNPERM_EXPERT_ORDER", "0") == "1" and os.environ.get("MODEL_REPRO_MOE_UNPERM_VERBOSE", "0") == "1":
+                    import paddle.distributed as _pv
+                    _vr = _pv.get_rank() if _pv.is_initialized() else 0
+                    print(f"[UNPERM-VERBOSE] r{_vr} gathersum rm={_out_final.shape} tpe={_tpe_loc.cast('int32').numpy().tolist()[:4]}...", flush=True)
+                _out_loc = _out_final.cast(hidden_states.dtype)
+                _out_full = paddle.zeros_like(hidden_states)
+                _out_full[_lo:_hi] = _out_loc
+                return _out_full
+
             tokens_per_expert = routing_map.sum(axis=0)
             permuted_local_hidden_states, sorted_indices = permute(
-                hidden_states, routing_map, tokens_per_expert
+                hidden_states,
+                routing_map,
+                tokens_per_expert,
+                use_accuracy_compatible=_use_ac,
             )
-            grouped_expert_out = self.grouped_gemm_experts(
-                permuted_local_hidden_states, tokens_per_expert
-            )[0]
-            final_hidden_states = unpermute(
-                grouped_expert_out,
-                sorted_indices,
-                restore_shape=hidden_states.shape,
-                probs=probs,
-                routing_map=routing_map,
-            )
+            _idx_dump = os.environ.get("MODEL_REPRO_UNPERM_INDEX_DUMP")
+            if _idx_dump:
+                import paddle.distributed as _pdix
+
+                _ir = _pdix.get_rank() if _pdix.is_initialized() else 0
+                _lidx = getattr(self, "layer_number", "x")
+                os.makedirs(_idx_dump, exist_ok=True)
+                sorted_indices.detach().cpu().numpy().astype("int64").tofile(
+                    os.path.join(_idx_dump, f"paddle_sorted_indices_l{_lidx}_r{_ir}.i64.bin")
+                )
+                routing_map.cast("uint8").detach().cpu().numpy().tofile(
+                    os.path.join(_idx_dump, f"paddle_routing_map_l{_lidx}_r{_ir}.u8.bin")
+                )
+                tokens_per_expert.cast("int64").detach().cpu().numpy().tofile(
+                    os.path.join(_idx_dump, f"paddle_tpe_l{_lidx}_r{_ir}.i64.bin")
+                )
+                with open(
+                    os.path.join(_idx_dump, f"paddle_unperm_meta_l{_lidx}_r{_ir}.txt"),
+                    "w",
+                ) as _mf:
+                    _mf.write(
+                        f"hidden={tuple(hidden_states.shape)} perm={tuple(permuted_local_hidden_states.shape)} "
+                        f"si={tuple(sorted_indices.shape)} rm={tuple(routing_map.shape)} "
+                        f"use_ac={_use_ac} tp={self.tensor_model_parallel_size}\n"
+                    )
+            # E-107/E-115: mcore batches each expert GEMM on the rank-local SP
+            # shard's tokens; paddle's permute output holds the union of all TP
+            # shards. row_owner maps each permuted row to its shard id so the
+            # expert layer can re-group GEMMs per shard (M alignment).
+            #
+            # Under ``use_accuracy_compatible`` this is required for numerical
+            # equivalence, not merely an optimization: bf16 GEMM rows are not
+            # M-invariant, so running one GEMM over the 60-token union produces
+            # different rows than mcore's two 30-token per-shard GEMMs even
+            # though the inputs are bit-identical.
+            _row_owner = None
+            if _shard_gemm:
+                _shard_len = max(
+                    hidden_states.shape[0] // max(self.tensor_model_parallel_size, 1),
+                    1,
+                )
+                _row_owner = sorted_indices // _shard_len
+            if _prescale_combine:
+                # E-114 probe: mcore folds the routing probs into the post-GLU
+                # activation BEFORE fc2 (Megatron experts.py:787-788), and then
+                # unpermutes WITHOUT probs so the fp32 accumulate path runs
+                # (moe_utils._unpermute_fp32_accum). PaddleFleet's default
+                # branch (b) multiplies probs AFTER fc2 inside unpermute
+                # (ApplyPermutedProbs) and then scatters; the two are algebraically
+                # identical but round differently in bf16.
+                _permuted_probs = None
+                if probs is not None:
+                    _permuted_probs = probs.T.contiguous().masked_select(
+                        routing_map.T.contiguous().cast("bool")
+                    )
+                grouped_expert_out = self.grouped_gemm_experts(
+                    permuted_local_hidden_states,
+                    tokens_per_expert,
+                    permuted_probs=_permuted_probs,
+                    row_owner=_row_owner,
+                )[0]
+                # Keep routing_map even when probs are already folded: the
+                # accuracy-compatible unpermute uses it to rebuild the
+                # token-major gather index (Megatron token_dispatcher.py
+                # passes routing_map into unpermute with merging_probs=None).
+                # Passing None dropped through to scatter_add and skipped the
+                # aligned gather-sum backward (E-256).
+                final_hidden_states = unpermute(
+                    grouped_expert_out,
+                    sorted_indices,
+                    restore_shape=hidden_states.shape,
+                    probs=None,
+                    routing_map=routing_map if _use_ac else None,
+                    use_accuracy_compatible=_use_ac,
+                )
+            else:
+                grouped_expert_out = self.grouped_gemm_experts(
+                    permuted_local_hidden_states,
+                    tokens_per_expert,
+                    row_owner=_row_owner,
+                )[0]
+                final_hidden_states = unpermute(
+                    grouped_expert_out,
+                    sorted_indices,
+                    restore_shape=hidden_states.shape,
+                    probs=probs,
+                    routing_map=routing_map,
+                    use_accuracy_compatible=_use_ac,
+                )
             return final_hidden_states.cast(hidden_states.dtype)
 
     def fp8_quant_weight(self, batch_mode=False, quant_transpose=True):
@@ -1705,6 +2227,10 @@ class MoELayer(nn.Layer):
     def set_layer_number(self, layer_number, is_mtp_layer: bool = False):
         self.layer_number = layer_number
         self.is_mtp_layer = is_mtp_layer
+        experts = getattr(self, "grouped_gemm_experts", None)
+        if experts is not None:
+            experts.layer_number = layer_number
+            experts.is_mtp_layer = is_mtp_layer
         # Assign routed-expert 'color' now that the layer number is known. This
         # is the single place color is set for experts (Paddle forbids
         # reassigning it): the MTP-shared last layer uses the no-hook color.

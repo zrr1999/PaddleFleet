@@ -1,0 +1,1 @@
+E-747 N=5 dump-off unique ckpt_e747p2e2_* decoder routing-column sort fail-closed: paddle TakeAlongAxisGrad segfault exit 241 after needle. Torch IEEE-equal E-668. Injector disconnected. n100_allowed=false.

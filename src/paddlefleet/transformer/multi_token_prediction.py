@@ -579,8 +579,78 @@ class MultiTokenPredictionLayer(FleetLayer):
         is [s, b, h] (single-stream embedding). Uses separate e_proj and h_proj.
         In non-mHC mode, concatenates and projects with eh_proj as before.
         """
+        _enorm_x = decoder_input
         decoder_input = self.enorm(decoder_input)
         _mtp_trace("enorm_out", decoder_input)
+        dump_enorm = os.environ.get("MODEL_REPRO_ENORM_HASH_DIR")
+        if dump_enorm:
+            from paddlefleet.transformer.multi_latent_attention import (
+                _E497_QA_CALLS,
+                _e497_qa_sha,
+            )
+            import json
+            import paddle.distributed as dist
+
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            key = f"enorm|0|1|{rank}"
+            _E497_QA_CALLS[key] = _E497_QA_CALLS.get(key, 0) + 1
+            call = _E497_QA_CALLS[key]
+            os.makedirs(dump_enorm, exist_ok=True)
+            rec = {
+                "kind": "fwd",
+                "tag": "enorm",
+                "layer": 0,
+                "mtp": 1,
+                "rank": int(rank),
+                "call": int(call),
+                "shape_x": list(_enorm_x.shape),
+                "shape_y": list(decoder_input.shape),
+                "sha_x": _e497_qa_sha(_enorm_x),
+                "sha_y": _e497_qa_sha(decoder_input),
+            }
+            with open(os.path.join(dump_enorm, f"rank{rank}.jsonl"), "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            if not getattr(self, "_e571_enorm_announced", False):
+                print(f"[E571-ENORM-HASH] dir={dump_enorm} rank={rank} call={call}", flush=True)
+                self._e571_enorm_announced = True
+
+            def _on_enorm_dy(g, *, _dump=dump_enorm, _rank=rank, _call=call):
+                if g is None:
+                    return g
+                bwd = {
+                    "kind": "bwd",
+                    "tag": "enorm",
+                    "layer": 0,
+                    "mtp": 1,
+                    "rank": int(_rank),
+                    "call": int(_call),
+                    "shape_dy": list(g.shape),
+                    "sha_dy": _e497_qa_sha(g),
+                }
+                with open(os.path.join(_dump, f"rank{_rank}.jsonl"), "a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(bwd, ensure_ascii=False) + "\n")
+                return g
+
+            if getattr(decoder_input, "stop_gradient", True) is False:
+                decoder_input.register_hook(_on_enorm_dy)
+            if getattr(_enorm_x, "stop_gradient", True) is False:
+                def _on_enorm_dx(g, *, _dump=dump_enorm, _rank=rank, _call=call):
+                    if g is None:
+                        return g
+                    bwd = {
+                        "kind": "bwd_x",
+                        "tag": "enorm",
+                        "layer": 0,
+                        "mtp": 1,
+                        "rank": int(_rank),
+                        "call": int(_call),
+                        "shape_dx": list(g.shape),
+                        "sha_dx": _e497_qa_sha(g),
+                    }
+                    with open(os.path.join(_dump, f"rank{_rank}.jsonl"), "a", encoding="utf-8") as stream:
+                        stream.write(json.dumps(bwd, ensure_ascii=False) + "\n")
+                    return g
+                _enorm_x.register_hook(_on_enorm_dx)
 
         if self.mhc_enabled:
             # mHC mode: hidden_states is [s, b, n*h]
@@ -646,8 +716,22 @@ class MultiTokenPredictionLayer(FleetLayer):
                     hidden_states
                 )
         else:
+            _hnorm_x = hidden_states
             hidden_states = self.hnorm(hidden_states)
             _mtp_trace("hnorm_out", hidden_states)
+            if os.environ.get("MODEL_REPRO_FLN_BIN_DIR"):
+                from paddlefleet.transformer.multi_latent_attention import (
+                    _e497_qa_record,
+                )
+
+                _e497_qa_record(
+                    "hnorm",
+                    _hnorm_x,
+                    hidden_states,
+                    getattr(self.hnorm, "weight", None),
+                    getattr(self, "layer_number", 0),
+                    True,
+                )
             # Apply mtp_hidden_inputs_mask to mask out hidden state contributions
             # at specific positions (e.g. EOS boundaries) in MTP.
             # mask shape: [B, 1, S] -> [B, S, 1] to broadcast with hidden_states [B, S, H]
@@ -713,10 +797,25 @@ class MultiTokenPredictionLayer(FleetLayer):
             # and the (i + K)-th token's embedding, and combine them with linear projection.
             hidden_states = paddle.cat((decoder_input, hidden_states), -1)
             _mtp_trace("concat_out", hidden_states)
+            _eh_x = hidden_states
             hidden_states = self.eh_proj(hidden_states)
             if isinstance(hidden_states, tuple):
                 hidden_states, _ = hidden_states
             _mtp_trace("eh_proj_out", hidden_states)
+            if os.environ.get("MODEL_REPRO_FLN_BIN_DIR"):
+                from paddlefleet.transformer.multi_latent_attention import (
+                    _e497_qa_record,
+                )
+
+                _eh_w = getattr(self.eh_proj, "weight", None)
+                _e497_qa_record(
+                    "ehproj",
+                    _eh_x,
+                    hidden_states,
+                    _eh_w,
+                    getattr(self, "layer_number", 0),
+                    True,
+                )
             # For tensor parallel we need to gather the tensor across the model-parallel
             # ranks after the linear projection. This used to call
             # `all_gather_last_dim_from_tensor_parallel_region`, but that utility reduces
@@ -734,6 +833,58 @@ class MultiTokenPredictionLayer(FleetLayer):
                         hidden_states
                     )
         _mtp_trace("concat_embeddings_out", hidden_states)
+        # E-567: dump-off Y+dY of MTP transformer incoming (post TP-gather+SP-scatter).
+        dump_mtpin = os.environ.get("MODEL_REPRO_MTPIN_HASH_DIR")
+        if dump_mtpin:
+            from paddlefleet.transformer.multi_latent_attention import (
+                _E497_QA_CALLS,
+                _e497_qa_sha,
+            )
+            import json
+            import paddle.distributed as dist
+
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            key = f"mtpin|0|1|{rank}"
+            _E497_QA_CALLS[key] = _E497_QA_CALLS.get(key, 0) + 1
+            call = _E497_QA_CALLS[key]
+            os.makedirs(dump_mtpin, exist_ok=True)
+            rec = {
+                "kind": "fwd",
+                "tag": "mtpin",
+                "layer": 0,
+                "mtp": 1,
+                "rank": int(rank),
+                "call": int(call),
+                "shape_y": list(hidden_states.shape),
+                "dtype_y": str(hidden_states.dtype),
+                "sha_y": _e497_qa_sha(hidden_states),
+            }
+            with open(os.path.join(dump_mtpin, f"rank{rank}.jsonl"), "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            if not getattr(self, "_e567_mtpin_announced", False):
+                print(f"[E567-MTPIN-HASH] dir={dump_mtpin} rank={rank} call={call}", flush=True)
+                self._e567_mtpin_announced = True
+
+            def _on_mtpin_dy(g, *, _dump=dump_mtpin, _rank=rank, _call=call):
+                if g is None:
+                    return g
+                bwd = {
+                    "kind": "bwd",
+                    "tag": "mtpin",
+                    "layer": 0,
+                    "mtp": 1,
+                    "rank": int(_rank),
+                    "call": int(_call),
+                    "shape_dy": list(g.shape),
+                    "dtype_dy": str(g.dtype),
+                    "sha_dy": _e497_qa_sha(g),
+                }
+                with open(os.path.join(_dump, f"rank{_rank}.jsonl"), "a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(bwd, ensure_ascii=False) + "\n")
+                return g
+
+            if getattr(hidden_states, "stop_gradient", True) is False:
+                hidden_states.register_hook(_on_mtpin_dy)
         return hidden_states
 
     def _proj_and_transformer_layer(
@@ -825,6 +976,56 @@ class MultiTokenPredictionLayer(FleetLayer):
         ):
             hidden_states = self.norm(hidden_states)
             _mtp_trace("final_layernorm_out", hidden_states)
+
+        dump_mtpout = os.environ.get("MODEL_REPRO_MTPOUT_HASH_DIR")
+        if dump_mtpout:
+            from paddlefleet.transformer.multi_latent_attention import (
+                _E497_QA_CALLS,
+                _e497_qa_sha,
+            )
+            import json
+            import paddle.distributed as dist
+
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            key = f"mtpout|0|1|{rank}"
+            _E497_QA_CALLS[key] = _E497_QA_CALLS.get(key, 0) + 1
+            call = _E497_QA_CALLS[key]
+            os.makedirs(dump_mtpout, exist_ok=True)
+            rec = {
+                "kind": "fwd",
+                "tag": "mtpout",
+                "layer": 0,
+                "mtp": 1,
+                "rank": int(rank),
+                "call": int(call),
+                "shape_y": list(hidden_states.shape),
+                "sha_y": _e497_qa_sha(hidden_states),
+            }
+            with open(os.path.join(dump_mtpout, f"rank{rank}.jsonl"), "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            if not getattr(self, "_e570_mtpout_announced", False):
+                print(f"[E570-MTPOUT-HASH] dir={dump_mtpout} rank={rank} call={call}", flush=True)
+                self._e570_mtpout_announced = True
+
+            def _on_mtpout_dy(g, *, _dump=dump_mtpout, _rank=rank, _call=call):
+                if g is None:
+                    return g
+                bwd = {
+                    "kind": "bwd",
+                    "tag": "mtpout",
+                    "layer": 0,
+                    "mtp": 1,
+                    "rank": int(_rank),
+                    "call": int(_call),
+                    "shape_dy": list(g.shape),
+                    "sha_dy": _e497_qa_sha(g),
+                }
+                with open(os.path.join(_dump, f"rank{_rank}.jsonl"), "a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(bwd, ensure_ascii=False) + "\n")
+                return g
+
+            if getattr(hidden_states, "stop_gradient", True) is False:
+                hidden_states.register_hook(_on_mtpout_dy)
 
         return hidden_states
 

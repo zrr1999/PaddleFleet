@@ -446,9 +446,59 @@ class LanguageLoss(FleetLayer):
 
         seq_len = logits.shape[1]
 
-        # Loss-path MD5 probe: logits and labels before cross-entropy
-        import os
+        # E-539: CPU dump of last-stage call-5 ParallelCrossEntropy operands.
+        # Observation only; returns tensors unchanged.
+        _ce_dump = os.environ.get("MODEL_REPRO_CE_BIN_DIR")
+        if _ce_dump and not isinstance(logits, tuple):
+            try:
+                _rank = int(dist.get_rank()) if dist.is_initialized() else 0
+            except Exception:
+                _rank = 0
+            if _rank in (2, 3):
+                ntok = int(logits.shape[1]) if logits.ndim >= 2 else int(logits.shape[0])
+                # Last-stage SP-gathered logits at call 5 are S=168.
+                if ntok == 168:
+                    hits = getattr(self, "_e539_ce_hits", 0) + 1
+                    self._e539_ce_hits = hits
+                    if hits == 1:
+                        import json
 
+                        os.makedirs(_ce_dump, exist_ok=True)
+                        lg = logits.detach().contiguous()
+                        lb = labels.detach().contiguous()
+                        if "bfloat16" in str(lg.dtype):
+                            lg_buf = lg.view(dtype="uint16").cpu().numpy()
+                            lg_suf = "bf16"
+                        else:
+                            lg_buf = lg.cast("float32").cpu().numpy()
+                            lg_suf = "f32"
+                        lb_buf = lb.cast("int64").cpu().numpy()
+                        stem = f"paddle_ce_r{_rank}_h{hits}_S{ntok}"
+                        lg_buf.tofile(os.path.join(_ce_dump, f"{stem}_logits.{lg_suf}.bin"))
+                        lb_buf.tofile(os.path.join(_ce_dump, f"{stem}_labels.i64.bin"))
+                        meta = {
+                            "framework": "paddle",
+                            "rank": _rank,
+                            "hit": hits,
+                            "ntok": ntok,
+                            "logits_shape": list(lg.shape),
+                            "labels_shape": list(lb.shape),
+                            "logits_dtype": str(lg.dtype),
+                            "labels_dtype": str(lb.dtype),
+                            "suffix": lg_suf,
+                        }
+                        with open(
+                            os.path.join(_ce_dump, f"{stem}.json"), "w", encoding="utf-8"
+                        ) as stream:
+                            json.dump(meta, stream, sort_keys=True)
+                            stream.write("\n")
+                        print(
+                            f"[E539-CE-BIN] dir={_ce_dump} rank={_rank} {stem} "
+                            f"logits={list(lg.shape)} labels={list(lb.shape)}",
+                            flush=True,
+                        )
+
+        # Loss-path MD5 probe: logits and labels before cross-entropy
         if (
             os.environ.get("LOG_LAYER_MD5", "0") == "1"
             or os.environ.get("LOG_LOSS_MD5", "0") == "1"

@@ -275,6 +275,132 @@ def _initialize_affine_weight_cpu(
     return None
 
 
+_EMBED_IDS_CALL = 0
+
+
+def _dump_embed_lookup_ids(input_, masked_input, input_mask, vocab_start, vocab_end):
+    """Dump-only embedding lookup ids. Observation, not a wrap."""
+    dump = os.environ.get("MODEL_REPRO_EMBED_IDS_DIR")
+    hashdir = os.environ.get("MODEL_REPRO_EMBED_IDS_HASH_DIR")
+    if not dump and not hashdir:
+        return
+    import hashlib
+    import json
+
+    global _EMBED_IDS_CALL
+    _EMBED_IDS_CALL += 1
+    try:
+        rank = int(dist.get_rank()) if dist.is_initialized() else 0
+    except Exception:
+        rank = 0
+    step_env = os.environ.get("MODEL_REPRO_STEP", "")
+    ids = masked_input.detach().cpu().numpy()
+    raw = input_.detach().cpu().numpy()
+    mask = None
+    if input_mask is not None:
+        mask = input_mask.detach().cpu().numpy().astype("uint8")
+    n = int(ids.size)
+    prefix = ids.reshape(-1)[:-1] if n > 1 else ids.reshape(-1)
+    meta = {
+        "kind": "fwd",
+        "tag": "embed_ids",
+        "framework": "paddle",
+        "rank": rank,
+        "call": _EMBED_IDS_CALL,
+        "step_env": step_env,
+        "shape": list(ids.shape),
+        "n": n,
+        "vocab_start": int(vocab_start),
+        "vocab_end": int(vocab_end),
+        "masked_sha256": hashlib.sha256(ids.tobytes()).hexdigest(),
+        "input_sha256": hashlib.sha256(raw.tobytes()).hexdigest(),
+        "prefix_n": int(prefix.size),
+        "prefix_sha256": hashlib.sha256(prefix.tobytes()).hexdigest(),
+        "n_oov": int(mask.sum()) if mask is not None else 0,
+        "n_unique_masked": int(len(set(ids.reshape(-1).tolist()))),
+    }
+    if hashdir:
+        os.makedirs(hashdir, exist_ok=True)
+        with open(os.path.join(hashdir, f"rank{rank}.jsonl"), "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(meta, ensure_ascii=False) + "\n")
+        if _EMBED_IDS_CALL == 1:
+            print(
+                f"[E576-EMBED-IDS-HASH] dir={hashdir} rank={rank} "
+                f"n={n} prefix_n={meta['prefix_n']}",
+                flush=True,
+            )
+    if dump:
+        os.makedirs(dump, exist_ok=True)
+        stem = f"paddle_embed_r{rank}_c{_EMBED_IDS_CALL}_L{int(ids.size)}"
+        ids.tofile(os.path.join(dump, f"{stem}_masked.i64.bin"))
+        raw.tofile(os.path.join(dump, f"{stem}_input.i64.bin"))
+        if mask is not None:
+            mask.tofile(os.path.join(dump, f"{stem}_mask.u8.bin"))
+        with open(os.path.join(dump, f"{stem}.json"), "w", encoding="utf-8") as handle:
+            json.dump(meta, handle, sort_keys=True)
+            handle.write("\n")
+        print(
+            f"[EMBED-IDS-DUMP] r{rank} c{_EMBED_IDS_CALL} n={ids.size} "
+            f"oov={meta['n_oov']} sha={meta['masked_sha256'][:16]}",
+            flush=True,
+        )
+
+
+_EMBED_CHAIN_HITS: dict[str, int] = {}
+
+
+def _maybe_dump_embed_chain(tensor, tag: str):
+    """Dump-only dY of VocabParallelEmbedding allreduce/slice. CPU, n in {168,169}."""
+    dump = os.environ.get("MODEL_REPRO_EMBED_CHAIN_DIR")
+    if not dump or tensor is None:
+        return tensor
+    if getattr(tensor, "stop_gradient", True):
+        return tensor
+
+    def _hook(g, *, _dump=dump, _tag=tag):
+        if g is None:
+            return g
+        hidden = int(g.shape[-1]) if g.ndim >= 1 else 1
+        ntok = int(g.size) // hidden if hidden else 0
+        if ntok not in (168, 169):
+            return g
+        import hashlib
+        import json
+
+        try:
+            rank = int(dist.get_rank()) if dist.is_initialized() else 0
+        except Exception:
+            rank = 0
+        key = f"{rank}|{_tag}"
+        _EMBED_CHAIN_HITS[key] = _EMBED_CHAIN_HITS.get(key, 0) + 1
+        hit = _EMBED_CHAIN_HITS[key]
+        os.makedirs(_dump, exist_ok=True)
+        dy = g.detach().cpu().astype("float32").numpy()
+        stem = f"paddle_chain_{_tag}_r{rank}_h{hit}_L{ntok}"
+        dy.tofile(os.path.join(_dump, f"{stem}.f32.bin"))
+        meta = {
+            "framework": "paddle",
+            "tag": _tag,
+            "rank": rank,
+            "hit": int(hit),
+            "ntok": ntok,
+            "dy_shape": list(dy.shape),
+            "dy_sha256": hashlib.sha256(dy.tobytes()).hexdigest(),
+        }
+        with open(os.path.join(_dump, f"{stem}.json"), "w", encoding="utf-8") as handle:
+            json.dump(meta, handle, sort_keys=True)
+            handle.write("\n")
+        print(
+            f"[EMBED-CHAIN] {_tag} r{rank} h={hit} n={ntok} "
+            f"shape={tuple(dy.shape)} sha={meta['dy_sha256'][:16]}",
+            flush=True,
+        )
+        return g
+
+    tensor.register_hook(_hook)
+    return tensor
+
+
 class _EmbedFp32MainGrad(paddle.autograd.Function):
     """UAC embedding lookup whose wgrad lands in fp32 main_grad.
 
@@ -285,6 +411,7 @@ class _EmbedFp32MainGrad(paddle.autograd.Function):
     """
 
     _printed = 0
+    _dy_hits = 0
 
     @staticmethod
     def forward(ctx, weight, ids):
@@ -296,6 +423,71 @@ class _EmbedFp32MainGrad(paddle.autograd.Function):
     def backward(ctx, grad_output):
         ids = ctx.saved_tensor()[0]
         weight = ctx.weight_ref
+        # E-530 dump-only: live dY of each IndexingBackward (fused vs two).
+        # Observation; returning grad_output unchanged. Gated so dump-off
+        # 10-step bits stay E-527 when the env is unset.
+        # Hit counter is monotonic: the first draft reused _printed and
+        # decremented it, so every step overwrote h1/h2.
+        dump_dy = os.environ.get("MODEL_REPRO_EMBED_DY_DIR")
+        hashdir = os.environ.get("MODEL_REPRO_EMBED_DY_HASH_DIR")
+        if dump_dy or hashdir:
+            import hashlib
+            import json
+
+            _EmbedFp32MainGrad._dy_hits += 1
+            hit = _EmbedFp32MainGrad._dy_hits
+            try:
+                rank = int(dist.get_rank()) if dist.is_initialized() else 0
+            except Exception:
+                rank = 0
+            dy = grad_output.detach().astype("float32").numpy()
+            idn = ids.detach().numpy()
+            meta = {
+                "kind": "bwd",
+                "tag": "embed_dy",
+                "framework": "paddle",
+                "rank": rank,
+                "hit": hit,
+                "ids_shape": list(idn.shape),
+                "dy_shape": list(dy.shape),
+                "ids_n": int(idn.size),
+                "dy_sha256": hashlib.sha256(dy.tobytes()).hexdigest(),
+                "ids_sha256": hashlib.sha256(idn.tobytes()).hexdigest(),
+            }
+            if hashdir:
+                os.makedirs(hashdir, exist_ok=True)
+                with open(
+                    os.path.join(hashdir, f"rank{rank}.jsonl"),
+                    "a",
+                    encoding="utf-8",
+                ) as handle:
+                    handle.write(json.dumps(meta, ensure_ascii=False) + "\n")
+                if hit == 1:
+                    print(
+                        f"[E546-EMBED-DY-HASH] dir={hashdir} rank={rank} hit={hit} "
+                        f"ids_n={meta['ids_n']} sha={meta['dy_sha256'][:16]}",
+                        flush=True,
+                    )
+            if dump_dy:
+                os.makedirs(dump_dy, exist_ok=True)
+                stem = (
+                    f"paddle_embed_dy_r{rank}_h{hit}_L{int(idn.size)}"
+                )
+                dy.tofile(os.path.join(dump_dy, f"{stem}.f32.bin"))
+                idn.tofile(os.path.join(dump_dy, f"{stem}_ids.i64.bin"))
+                with open(
+                    os.path.join(dump_dy, f"{stem}.json"),
+                    "w",
+                    encoding="utf-8",
+                ) as handle:
+                    json.dump(meta, handle, sort_keys=True)
+                    handle.write("\n")
+                print(
+                    f"[EMBED-DY-DUMP] r{rank} hit={hit} "
+                    f"ids={tuple(idn.shape)} dy={tuple(dy.shape)} "
+                    f"sha={meta['dy_sha256'][:16]}",
+                    flush=True,
+                )
         # Function.backward disables grads (E-472 gw=None). Re-enable so
         # W[ids] is IndexingBackward on a clone, not embedding_grad_add_to_
         # (E-468 nz 233424) and not MixPrecision bf16 merge (E-470 hit=1).
@@ -450,6 +642,164 @@ class VocabParallelEmbedding(paddle.nn.Layer):
             masked_input[input_mask] = 0
         else:
             masked_input = input_
+            input_mask = None
+        _dump_embed_lookup_ids(
+            input_,
+            masked_input,
+            input_mask,
+            self.vocab_start_index,
+            self.vocab_end_index,
+        )
+        # E-576 dump-off: lookup W hash once per rank. Observation only.
+        dump_w = os.environ.get("MODEL_REPRO_EMBED_W_HASH_DIR")
+        if dump_w and not getattr(self, "_e576_w_hashed", False):
+            import hashlib
+            import json
+
+            try:
+                rank = int(dist.get_rank()) if dist.is_initialized() else 0
+            except Exception:
+                rank = 0
+            os.makedirs(dump_w, exist_ok=True)
+            w = self.weight.detach().cpu()
+            rec = {
+                "kind": "param",
+                "tag": "embed_w",
+                "framework": "paddle",
+                "rank": int(rank),
+                "shape": list(w.shape),
+                "dtype": str(w.dtype),
+                "sha_w": hashlib.sha256(
+                    w.contiguous().view(dtype="uint16").numpy().tobytes()
+                    if "bfloat16" in str(w.dtype)
+                    else w.contiguous().numpy().tobytes()
+                ).hexdigest(),
+                "vocab_start": int(self.vocab_start_index),
+                "vocab_end": int(self.vocab_end_index),
+            }
+            with open(os.path.join(dump_w, f"rank{rank}.jsonl"), "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            print(
+                f"[E576-EMBED-W-HASH] dir={dump_w} rank={rank} shape={rec['shape']} "
+                f"sha={rec['sha_w'][:16]}",
+                flush=True,
+            )
+            self._e576_w_hashed = True
+        # E-578 dump-off: W at fused-169 / MTP-168 calls, not first lookup.
+        dump_w_fused = os.environ.get("MODEL_REPRO_EMBED_W_AT_FUSED_HASH_DIR")
+        if dump_w_fused:
+            import hashlib
+            import json
+
+            idn = int(masked_input.numel())
+            if idn in (168, 169):
+                try:
+                    rank = int(dist.get_rank()) if dist.is_initialized() else 0
+                except Exception:
+                    rank = 0
+                if not hasattr(_EmbedFp32MainGrad, "_e578_w_hits"):
+                    _EmbedFp32MainGrad._e578_w_hits = 0
+                _EmbedFp32MainGrad._e578_w_hits += 1
+                hit = _EmbedFp32MainGrad._e578_w_hits
+                os.makedirs(dump_w_fused, exist_ok=True)
+                w = self.weight.detach().cpu()
+                rec = {
+                    "kind": "param",
+                    "tag": "embed_w_at_fused",
+                    "framework": "paddle",
+                    "rank": int(rank),
+                    "hit": int(hit),
+                    "ids_n": int(idn),
+                    "shape": list(w.shape),
+                    "dtype": str(w.dtype),
+                    "sha_w": hashlib.sha256(
+                        w.contiguous().view(dtype="uint16").numpy().tobytes()
+                        if "bfloat16" in str(w.dtype)
+                        else w.contiguous().numpy().tobytes()
+                    ).hexdigest(),
+                    "vocab_start": int(self.vocab_start_index),
+                    "vocab_end": int(self.vocab_end_index),
+                }
+                with open(
+                    os.path.join(dump_w_fused, f"rank{rank}.jsonl"),
+                    "a",
+                    encoding="utf-8",
+                ) as handle:
+                    handle.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                print(
+                    f"[E578-EMBED-W-AT-FUSED-HASH] dir={dump_w_fused} rank={rank} "
+                    f"hit={hit} ids_n={idn} sha={rec['sha_w'][:16]}",
+                    flush=True,
+                )
+        # E-579 dump-off: unique W rows at fused-169, not the 905MiB table.
+        dump_rows = os.environ.get("MODEL_REPRO_EMBED_W_ROWS_DIR")
+        if dump_rows and int(masked_input.numel()) == 169:
+            import hashlib
+            import json
+
+            try:
+                rank = int(dist.get_rank()) if dist.is_initialized() else 0
+            except Exception:
+                rank = 0
+            if not getattr(self, "_e579_rows_dumped", False):
+                os.makedirs(dump_rows, exist_ok=True)
+                ids_full = masked_input.detach().reshape([-1])
+                ids_pref = ids_full[:-1]
+                uniq = paddle.unique(ids_pref)
+                rows = self.weight.detach()[uniq].contiguous().cpu()
+                uniq_np = uniq.cpu().numpy()
+                rows_u16 = (
+                    rows.view(dtype="uint16").numpy()
+                    if "bfloat16" in str(rows.dtype)
+                    else rows.numpy()
+                )
+                stem = f"paddle_embed_w_rows_r{rank}_n169"
+                uniq_np.astype("int64").tofile(os.path.join(dump_rows, f"{stem}_ids.i64.bin"))
+                rows_u16.tofile(os.path.join(dump_rows, f"{stem}.u16.bin"))
+                rec = {
+                    "kind": "param",
+                    "tag": "embed_w_rows",
+                    "framework": "paddle",
+                    "rank": int(rank),
+                    "ids_n": 169,
+                    "prefix_n": 168,
+                    "n_unique": int(uniq_np.size),
+                    "shape_rows": list(rows.shape),
+                    "sha_rows": hashlib.sha256(
+                        rows_u16.tobytes()
+                    ).hexdigest(),
+                    "sha_uniq_ids": hashlib.sha256(uniq_np.tobytes()).hexdigest(),
+                    "vocab_start": int(self.vocab_start_index),
+                    "vocab_end": int(self.vocab_end_index),
+                    "sha_w_full": hashlib.sha256(
+                        self.weight.detach()
+                        .contiguous()
+                        .cpu()
+                        .view(dtype="uint16")
+                        .numpy()
+                        .tobytes()
+                    ).hexdigest()
+                    if "bfloat16" in str(self.weight.dtype)
+                    else None,
+                }
+                with open(
+                    os.path.join(dump_rows, f"{stem}.json"),
+                    "w",
+                    encoding="utf-8",
+                ) as handle:
+                    json.dump(rec, handle, sort_keys=True)
+                with open(
+                    os.path.join(dump_rows, f"rank{rank}.jsonl"),
+                    "a",
+                    encoding="utf-8",
+                ) as handle:
+                    handle.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                print(
+                    f"[E579-EMBED-W-ROWS] dir={dump_rows} rank={rank} "
+                    f"n_unique={rec['n_unique']} sha_w={rec['sha_w_full'][:16] if rec['sha_w_full'] else None}",
+                    flush=True,
+                )
+                self._e579_rows_dumped = True
         # Get the embeddings.
         if self.deterministic_mode or self.use_accuracy_compatible:
             if os.environ.get("MODEL_REPRO_TWO_FP32_ACCUM", "") == "1":
@@ -461,6 +811,95 @@ class VocabParallelEmbedding(paddle.nn.Layer):
         else:
             # F.embedding currently has a non-deterministic backward function
             output_parallel = F.embedding(masked_input, self.weight)
+        # E-574 dump-off: fused lookup Y (pre-OOV-mask) + prefix dY[:-1]
+        # vs torch first n=S-1. Separate env from EMBED_DY / SLICE / FSLN.
+        dump_y = os.environ.get("MODEL_REPRO_EMBED_Y_HASH_DIR")
+        if dump_y:
+            import hashlib
+            import json
+
+            try:
+                rank = int(dist.get_rank()) if dist.is_initialized() else 0
+            except Exception:
+                rank = 0
+            if not hasattr(_EmbedFp32MainGrad, "_y_hits"):
+                _EmbedFp32MainGrad._y_hits = 0
+            _EmbedFp32MainGrad._y_hits += 1
+            hit = _EmbedFp32MainGrad._y_hits
+            os.makedirs(dump_y, exist_ok=True)
+            y = output_parallel.detach().cpu()
+            idn = masked_input.detach()
+            seq = int(y.shape[1]) if y.ndim >= 2 else int(y.shape[0])
+            y_prefix = y[:, :-1] if y.ndim >= 2 and seq > 1 else y
+            rec = {
+                "kind": "fwd",
+                "tag": "embed_y",
+                "framework": "paddle",
+                "rank": int(rank),
+                "hit": int(hit),
+                "ids_n": int(idn.size),
+                "shape_y": list(y.shape),
+                "sha_y": hashlib.sha256(
+                    y.contiguous().view(dtype="uint16").numpy().tobytes()
+                    if "bfloat16" in str(y.dtype)
+                    else y.contiguous().numpy().tobytes()
+                ).hexdigest(),
+                "shape_y_prefix": list(y_prefix.shape),
+                "sha_y_prefix": hashlib.sha256(
+                    y_prefix.contiguous().view(dtype="uint16").numpy().tobytes()
+                    if "bfloat16" in str(y_prefix.dtype)
+                    else y_prefix.contiguous().numpy().tobytes()
+                ).hexdigest(),
+            }
+            with open(os.path.join(dump_y, f"rank{rank}.jsonl"), "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            if hit == 1:
+                print(
+                    f"[E575-EMBED-Y-HASH] dir={dump_y} rank={rank} hit={hit} "
+                    f"ids_n={rec['ids_n']}",
+                    flush=True,
+                )
+
+            def _on_embed_y_dy(g, *, _dump=dump_y, _rank=rank, _hit=hit, _ids_n=int(idn.size)):
+                if g is None:
+                    return g
+                g_cpu = g.detach().cpu()
+                seq = int(g_cpu.shape[1]) if g_cpu.ndim >= 2 else int(g_cpu.shape[0])
+                prefix = g_cpu[:, :-1] if g_cpu.ndim >= 2 and seq > 1 else g_cpu
+                extra = g_cpu[:, -1:] if g_cpu.ndim >= 2 and seq > 1 else None
+                bwd = {
+                    "kind": "bwd",
+                    "tag": "embed_y",
+                    "framework": "paddle",
+                    "rank": int(_rank),
+                    "hit": int(_hit),
+                    "ids_n": int(_ids_n),
+                    "shape_dy": list(g_cpu.shape),
+                    "sha_dy": hashlib.sha256(
+                        g_cpu.contiguous().view(dtype="uint16").numpy().tobytes()
+                        if "bfloat16" in str(g_cpu.dtype)
+                        else g_cpu.contiguous().numpy().tobytes()
+                    ).hexdigest(),
+                    "shape_dy_prefix": list(prefix.shape),
+                    "sha_dy_prefix": hashlib.sha256(
+                        prefix.contiguous().view(dtype="uint16").numpy().tobytes()
+                        if "bfloat16" in str(prefix.dtype)
+                        else prefix.contiguous().numpy().tobytes()
+                    ).hexdigest(),
+                }
+                if extra is not None:
+                    bwd["shape_dy_extra"] = list(extra.shape)
+                    bwd["sha_dy_extra"] = hashlib.sha256(
+                        extra.contiguous().view(dtype="uint16").numpy().tobytes()
+                        if "bfloat16" in str(extra.dtype)
+                        else extra.contiguous().numpy().tobytes()
+                    ).hexdigest()
+                with open(os.path.join(_dump, f"rank{_rank}.jsonl"), "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(bwd, ensure_ascii=False) + "\n")
+                return g
+
+            if getattr(output_parallel, "stop_gradient", True) is False:
+                output_parallel.register_hook(_on_embed_y_dy)
         # Mask the output embedding.
         if get_pg_size(self.tp_group) > 1:
             output_parallel[input_mask, :] = 0.0
@@ -477,6 +916,7 @@ class VocabParallelEmbedding(paddle.nn.Layer):
             output = reduce_from_tensor_model_parallel_region(
                 output_parallel, group=self.tp_group
             )
+        output = _maybe_dump_embed_chain(output, "allreduce")
         return output
 
     def sharded_state_dict(

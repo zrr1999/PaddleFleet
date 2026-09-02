@@ -511,6 +511,129 @@ class GPTEmbedding(FleetLayer):
                     inputs_embeds = decoder_input[
                         :, : -self.config.num_nextn_predict_layers, :
                     ]
+                    # E-573 dump-off: concat-slice backbone after fused lookup,
+                    # before ScatterOp (drops extra token). Separate env from
+                    # EMBED_CHAIN / EMBED_DY / FSLN. Observation; return g.
+                    dump_slice = os.environ.get("MODEL_REPRO_SLICE_HASH_DIR")
+                    if dump_slice and getattr(inputs_embeds, "stop_gradient", True) is False:
+                        import hashlib
+                        import json
+
+                        import paddle.distributed as dist
+                        from paddlefleet.transformer.multi_latent_attention import (
+                            _E497_QA_CALLS,
+                            _e497_qa_sha,
+                        )
+
+                        try:
+                            rank = int(dist.get_rank()) if dist.is_initialized() else 0
+                        except Exception:
+                            rank = 0
+                        key = f"slice|{rank}"
+                        _E497_QA_CALLS[key] = _E497_QA_CALLS.get(key, 0) + 1
+                        call = _E497_QA_CALLS[key]
+                        os.makedirs(dump_slice, exist_ok=True)
+                        rec = {
+                            "kind": "fwd",
+                            "tag": "slice",
+                            "rank": int(rank),
+                            "call": int(call),
+                            "shape_y": list(inputs_embeds.shape),
+                            "sha_y": _e497_qa_sha(inputs_embeds),
+                            "sha_y_t01": _e497_qa_sha(inputs_embeds, t01=True)
+                            if inputs_embeds.ndim == 3
+                            else None,
+                            "extra_n": int(inputs_embeds_extra.shape[1])
+                            if inputs_embeds_extra.ndim >= 2
+                            else None,
+                        }
+                        with open(
+                            os.path.join(dump_slice, f"rank{rank}.jsonl"),
+                            "a",
+                            encoding="utf-8",
+                        ) as stream:
+                            stream.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                        if not getattr(self, "_e573_slice_announced", False):
+                            print(
+                                f"[E573-SLICE-HASH] dir={dump_slice} rank={rank} call={call}",
+                                flush=True,
+                            )
+                            self._e573_slice_announced = True
+
+                        def _on_slice_hash(g, *, _dump=dump_slice, _rank=rank, _call=call):
+                            if g is None:
+                                return g
+                            bwd = {
+                                "kind": "bwd",
+                                "tag": "slice",
+                                "rank": int(_rank),
+                                "call": int(_call),
+                                "shape_dy": list(g.shape),
+                                "sha_dy": _e497_qa_sha(g),
+                                "sha_dy_t01": _e497_qa_sha(g, t01=True) if g.ndim == 3 else None,
+                            }
+                            with open(
+                                os.path.join(_dump, f"rank{_rank}.jsonl"),
+                                "a",
+                                encoding="utf-8",
+                            ) as stream:
+                                stream.write(json.dumps(bwd, ensure_ascii=False) + "\n")
+                            return g
+
+                        inputs_embeds.register_hook(_on_slice_hash)
+                    # E-533 dump-only: dY of concat-slice backbone (pre-SP).
+                    dump_chain = os.environ.get("MODEL_REPRO_EMBED_CHAIN_DIR")
+                    if dump_chain and getattr(inputs_embeds, "stop_gradient", True) is False:
+                        if not hasattr(self, "_e533_slice_hits"):
+                            self._e533_slice_hits = {}
+
+                        def _on_slice(g, *, _dump=dump_chain, _hits=self._e533_slice_hits):
+                            if g is None:
+                                return g
+                            hidden = int(g.shape[-1]) if g.ndim >= 1 else 1
+                            ntok = int(g.size) // hidden if hidden else 0
+                            if ntok not in (168, 169, 84):
+                                return g
+                            import hashlib
+                            import json
+
+                            import paddle.distributed as dist
+
+                            try:
+                                rank = int(dist.get_rank()) if dist.is_initialized() else 0
+                            except Exception:
+                                rank = 0
+                            key = f"{rank}|{ntok}"
+                            _hits[key] = _hits.get(key, 0) + 1
+                            hit = _hits[key]
+                            os.makedirs(_dump, exist_ok=True)
+                            dy = g.detach().cpu().astype("float32").numpy()
+                            stem = f"paddle_chain_slice_r{rank}_h{hit}_L{ntok}"
+                            dy.tofile(os.path.join(_dump, f"{stem}.f32.bin"))
+                            meta = {
+                                "framework": "paddle",
+                                "tag": "slice",
+                                "rank": rank,
+                                "hit": int(hit),
+                                "ntok": ntok,
+                                "dy_shape": list(dy.shape),
+                                "dy_sha256": hashlib.sha256(dy.tobytes()).hexdigest(),
+                            }
+                            with open(
+                                os.path.join(_dump, f"{stem}.json"),
+                                "w",
+                                encoding="utf-8",
+                            ) as handle:
+                                json.dump(meta, handle, sort_keys=True)
+                                handle.write("\n")
+                            print(
+                                f"[EMBED-CHAIN] slice r{rank} h={hit} n={ntok} "
+                                f"shape={tuple(dy.shape)} sha={meta['dy_sha256'][:16]}",
+                                flush=True,
+                            )
+                            return g
+
+                        inputs_embeds.register_hook(_on_slice)
                     inputs_embeds_ori = inputs_embeds
                     batch_size, seq_length, hidden_size = inputs_embeds.shape
 

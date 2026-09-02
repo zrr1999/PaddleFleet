@@ -277,10 +277,87 @@ class WrappedPaddleNormPipe(paddle.nn.Layer):
                 hidden_states_concat, self.config.num_nextn_predict_layers + 1
             )
             dict_args["hidden_states"] = tensor_list[0]
+        _fln_x = dict_args["hidden_states"]
         rst = {
             **dict_args,
             "hidden_states": self.norm(dict_args["hidden_states"]),
         }
+        # E-538/E-540: hash/bin final_ln X/Y of the main (pre-concat) piece.
+        if os.environ.get("MODEL_REPRO_QA_XY_HASH_DIR") or os.environ.get(
+            "MODEL_REPRO_FLN_BIN_DIR"
+        ):
+            from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+
+            _e497_qa_record(
+                "fln",
+                _fln_x,
+                rst["hidden_states"],
+                getattr(self.norm, "weight", None),
+                -1,
+                False,
+            )
+            # Also record incoming dX on the last-decoder output (fln.X).
+            if getattr(_fln_x, "stop_gradient", True) is False:
+                from paddlefleet.transformer.multi_latent_attention import (
+                    _E497_QA_CALLS,
+                    _e497_qa_sha,
+                )
+                import json
+                import paddle.distributed as dist
+
+                _rank = dist.get_rank() if dist.is_initialized() else 0
+                _key = f"flndx|-1|0|{_rank}"
+                _E497_QA_CALLS[_key] = _E497_QA_CALLS.get(_key, 0) + 1
+                _call = _E497_QA_CALLS[_key]
+                _dump = os.environ.get("MODEL_REPRO_QA_XY_HASH_DIR")
+
+                def _on_dx(g, *, _dump=_dump, _rank=_rank, _call=_call):
+                    if g is None:
+                        return g
+                    bwd = {
+                        "kind": "bwd",
+                        "tag": "flndx",
+                        "layer": -1,
+                        "mtp": 0,
+                        "rank": int(_rank),
+                        "call": int(_call),
+                        "shape_dy": list(g.shape),
+                        "dtype_dy": str(g.dtype),
+                        "sha_dy": _e497_qa_sha(g),
+                        "sha_dy_t01": (
+                            _e497_qa_sha(g, t01=True) if g.ndim in (3, 4) else None
+                        ),
+                    }
+                    if _dump:
+                        with open(
+                            os.path.join(_dump, f"rank{_rank}.jsonl"),
+                            "a",
+                            encoding="utf-8",
+                        ) as stream:
+                            stream.write(json.dumps(bwd, ensure_ascii=False) + "\n")
+                    # E-605: dump-off call-5 last-stage incoming dX of final_ln.X
+                    # so L3.mlpbda.dY can be bound without QA_XY (dump-on).
+                    _bin = os.environ.get("MODEL_REPRO_FLN_BIN_DIR")
+                    if _bin and int(_call) == 5 and int(_rank) in (2, 3):
+                        from paddlefleet.transformer.multi_latent_attention import (
+                            _e537_dump_oproj_bin,
+                        )
+
+                        rec = {
+                            "layer": -1,
+                            "mtp": 0,
+                            "call": int(_call),
+                        }
+                        _e537_dump_oproj_bin("fln", "dx", g, rec, _rank, _bin)
+                        if not getattr(_on_dx, "_e605_announced", False):
+                            print(
+                                f"[E605-FLNDX-BIN] dir={_bin} rank={_rank} call={_call}",
+                                flush=True,
+                            )
+                            _on_dx._e605_announced = True
+                    return g
+
+                _fln_x.register_hook(_on_dx)
         if (
             self.config.num_nextn_predict_layers is not None
             and self.config.num_nextn_predict_layers > 0

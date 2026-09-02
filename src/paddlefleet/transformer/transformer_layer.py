@@ -43,6 +43,346 @@ from paddlefleet.recompute_utils import (
     need_recompute_in_block,
     need_recompute_in_first_n,
 )
+
+# [E497-LN-XY-HASH] hash-only X/Y/dY/W for input_layernorm. Hook returns g.
+_E497_LN_CALLS: dict[str, int] = {}
+
+
+def _e497_ln_sha(t, *, t01: bool = False) -> str:
+    x = t.detach()
+    if t01 and x.ndim == 3:
+        x = x.transpose([1, 0, 2])
+    x = x.contiguous()
+    if "bfloat16" in str(x.dtype):
+        buf = x.view(dtype="uint16").cpu().numpy().tobytes()
+    else:
+        buf = x.cpu().numpy().tobytes()
+    return hashlib.sha256(buf).hexdigest()
+
+
+_E532_LN_DX_HITS: dict[str, int] = {}
+
+
+def _e497_ln_record(x, y, w, layer, mtp) -> None:
+    dump = os.environ.get("MODEL_REPRO_QA_XY_HASH_DIR")
+    dump_dx = os.environ.get("MODEL_REPRO_LN_DX_DIR")
+    dump_mtpln = os.environ.get("MODEL_REPRO_MTPLN_HASH_DIR")
+    dump_fsln = os.environ.get("MODEL_REPRO_FSLN_HASH_DIR")
+    dump_bin = os.environ.get("MODEL_REPRO_FSLN_BIN_DIR")
+    if (not dump and not dump_dx and not dump_mtpln and not dump_fsln and not dump_bin) or y is None:
+        return
+    import json
+
+    import paddle.distributed as dist
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    key = f"ln|{layer}|{int(bool(mtp))}|{rank}"
+    _E497_LN_CALLS[key] = _E497_LN_CALLS.get(key, 0) + 1
+    call = _E497_LN_CALLS[key]
+    rec = {
+        "kind": "fwd",
+        "tag": "ln",
+        "layer": int(layer) if layer is not None else -1,
+        "mtp": int(bool(mtp)),
+        "rank": int(rank),
+        "call": int(call),
+        "shape_x": list(x.shape),
+        "dtype_x": str(x.dtype),
+        "sha_x": _e497_ln_sha(x),
+        "sha_x_t01": _e497_ln_sha(x, t01=True) if x.ndim == 3 else None,
+        "shape_y": list(y.shape),
+        "dtype_y": str(y.dtype),
+        "sha_y": _e497_ln_sha(y),
+        "sha_y_t01": _e497_ln_sha(y, t01=True) if y.ndim == 3 else None,
+        "shape_w": list(w.shape) if w is not None else None,
+        "dtype_w": str(w.dtype) if w is not None else None,
+        "sha_w": _e497_ln_sha(w) if w is not None else None,
+    }
+    if dump:
+        os.makedirs(dump, exist_ok=True)
+        if not getattr(_e497_ln_record, "_announced", False):
+            print(f"[E497-LN-XY-HASH] dir={dump} rank={rank}", flush=True)
+            _e497_ln_record._announced = True
+        with open(os.path.join(dump, f"rank{rank}.jsonl"), "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        def _on_dy(g, *, _dump=dump, _rank=rank, _base=rec):
+            if g is None:
+                return g
+            bwd = {
+                "kind": "bwd",
+                "tag": "ln",
+                "layer": _base["layer"],
+                "mtp": _base["mtp"],
+                "rank": _rank,
+                "call": _base["call"],
+                "shape_dy": list(g.shape),
+                "dtype_dy": str(g.dtype),
+                "sha_dy": _e497_ln_sha(g),
+                "sha_dy_t01": _e497_ln_sha(g, t01=True) if g.ndim == 3 else None,
+            }
+            with open(os.path.join(_dump, f"rank{_rank}.jsonl"), "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(bwd, ensure_ascii=False) + "\n")
+            return g
+
+        if getattr(y, "stop_gradient", True) is False:
+            y.register_hook(_on_dy)
+
+    # E-568: dump-off MTP transformer input_layernorm only. Separate env
+    # from QA_XY so decoder LN is not re-hashed.
+    if dump_mtpln and bool(mtp):
+        os.makedirs(dump_mtpln, exist_ok=True)
+        if not getattr(_e497_ln_record, "_mtpln_announced", False):
+            print(f"[E568-MTPLN-HASH] dir={dump_mtpln} rank={rank}", flush=True)
+            _e497_ln_record._mtpln_announced = True
+        slim = {
+            "kind": "fwd",
+            "tag": "mtpln",
+            "layer": rec["layer"],
+            "mtp": rec["mtp"],
+            "rank": int(rank),
+            "call": rec["call"],
+            "shape_x": rec["shape_x"],
+            "shape_y": rec["shape_y"],
+            "sha_x": rec["sha_x"],
+            "sha_y": rec["sha_y"],
+        }
+        with open(os.path.join(dump_mtpln, f"rank{rank}.jsonl"), "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(slim, ensure_ascii=False) + "\n")
+
+        def _on_mtpln_dy(g, *, _dump=dump_mtpln, _rank=rank, _base=rec):
+            if g is None:
+                return g
+            bwd = {
+                "kind": "bwd",
+                "tag": "mtpln",
+                "layer": _base["layer"],
+                "mtp": _base["mtp"],
+                "rank": int(_rank),
+                "call": _base["call"],
+                "shape_dy": list(g.shape),
+                "sha_dy": _e497_ln_sha(g),
+            }
+            with open(os.path.join(_dump, f"rank{_rank}.jsonl"), "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(bwd, ensure_ascii=False) + "\n")
+            return g
+
+        if getattr(y, "stop_gradient", True) is False:
+            y.register_hook(_on_mtpln_dy)
+
+    # E-572: dump-off first-stage input_layernorm (fused 169-id consumer
+    # after SP scatter). Paddle first-stage is mtp=0 ranks 0/1 (E-521).
+    # E-594 also dumps L1 (layer=1) on the same ranks. E-598 also dumps
+    # last-stage L2 (layer=2 ranks 2/3) so dump-off can bind L1.mlpbda.dY
+    # to L2.ln.dX. E-602 also dumps last-stage L3 (layer=3 ranks 2/3) so
+    # dump-off can bind L2.mlpbda.dY to L3.ln.dX. Separate env from QA_XY / MTPLN.
+    _is_fsln = (not bool(mtp)) and (
+        int(rank) in (0, 1) or (int(rank) in (2, 3) and int(rec["layer"]) in (2, 3))
+    )
+    if dump_fsln and _is_fsln:
+        os.makedirs(dump_fsln, exist_ok=True)
+        if not getattr(_e497_ln_record, "_fsln_announced", False):
+            print(f"[E572-FSLN-HASH] dir={dump_fsln} rank={rank}", flush=True)
+            _e497_ln_record._fsln_announced = True
+        slim = {
+            "kind": "fwd",
+            "tag": "fsln",
+            "layer": rec["layer"],
+            "mtp": rec["mtp"],
+            "rank": int(rank),
+            "call": rec["call"],
+            "shape_x": rec["shape_x"],
+            "shape_y": rec["shape_y"],
+            "sha_x": rec["sha_x"],
+            "sha_y": rec["sha_y"],
+        }
+        with open(os.path.join(dump_fsln, f"rank{rank}.jsonl"), "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(slim, ensure_ascii=False) + "\n")
+
+        def _on_fsln_dy(g, *, _dump=dump_fsln, _rank=rank, _base=rec):
+            if g is None:
+                return g
+            bwd = {
+                "kind": "bwd",
+                "tag": "fsln",
+                "layer": _base["layer"],
+                "mtp": _base["mtp"],
+                "rank": int(_rank),
+                "call": _base["call"],
+                "shape_dy": list(g.shape),
+                "sha_dy": _e497_ln_sha(g),
+            }
+            with open(os.path.join(_dump, f"rank{_rank}.jsonl"), "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(bwd, ensure_ascii=False) + "\n")
+            return g
+
+        if getattr(y, "stop_gradient", True) is False:
+            y.register_hook(_on_fsln_dy)
+
+        if getattr(x, "stop_gradient", True) is False:
+
+            def _on_fsln_dx(g, *, _dump=dump_fsln, _rank=rank, _base=rec):
+                if g is None:
+                    return g
+                bwd = {
+                    "kind": "bwd_x",
+                    "tag": "fsln",
+                    "layer": _base["layer"],
+                    "mtp": _base["mtp"],
+                    "rank": int(_rank),
+                    "call": _base["call"],
+                    "shape_dx": list(g.shape),
+                    "sha_dx": _e497_ln_sha(g),
+                }
+                with open(os.path.join(_dump, f"rank{_rank}.jsonl"), "a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(bwd, ensure_ascii=False) + "\n")
+                return g
+
+            x.register_hook(_on_fsln_dx)
+
+    # E-583: dump-off first-stage L0 LN call-5 uint16 bins (X/Y/W + dY/dX).
+    # Same first-stage gate as E-572. Hash-only path stays E-572; this env
+    # writes bins only at call==5 so dump stays small.
+    if dump_bin and _is_fsln:
+        os.makedirs(dump_bin, exist_ok=True)
+        if not getattr(_e497_ln_record, "_fsln_bin_announced", False):
+            print(f"[E603-LSL3-BIN] dir={dump_bin} rank={rank} layer={rec['layer']}", flush=True)
+            _e497_ln_record._fsln_bin_announced = True
+        if int(call) == 5:
+
+            def _e583_write_u16(stem, t, kind, *, _dump=dump_bin, _rank=rank, _base=rec, _call=call):
+                arr = t.detach().contiguous()
+                u16 = arr.view(dtype="uint16").cpu().numpy()
+                u16.tofile(os.path.join(_dump, f"{stem}.u16.bin"))
+                meta = {
+                    "framework": "paddle",
+                    "kind": kind,
+                    "tag": "fsln",
+                    "rank": int(_rank),
+                    "layer": _base["layer"],
+                    "mtp": _base["mtp"],
+                    "call": int(_call),
+                    "shape": list(arr.shape),
+                    "dtype": str(arr.dtype),
+                    "sha": _e497_ln_sha(t),
+                    "suffix": "u16",
+                }
+                with open(os.path.join(_dump, f"{stem}.json"), "w", encoding="utf-8") as handle:
+                    json.dump(meta, handle, sort_keys=True)
+                    handle.write("\n")
+
+            stem = f"paddle_fsln_r{rank}_c{call}_L{rec['layer']}"
+            _e583_write_u16(f"{stem}_x", x, "x")
+            _e583_write_u16(f"{stem}_y", y, "y")
+            if w is not None:
+                _e583_write_u16(f"{stem}_w", w, "w")
+
+            def _on_fsln_bin_dy(g, *, _dump=dump_bin, _stem=stem, _rank=rank, _base=rec, _call=call):
+                if g is None:
+                    return g
+                arr = g.detach().contiguous()
+                u16 = arr.view(dtype="uint16").cpu().numpy()
+                u16.tofile(os.path.join(_dump, f"{_stem}_dy.u16.bin"))
+                meta = {
+                    "framework": "paddle",
+                    "kind": "dy",
+                    "tag": "fsln",
+                    "rank": int(_rank),
+                    "layer": _base["layer"],
+                    "mtp": _base["mtp"],
+                    "call": int(_call),
+                    "shape": list(arr.shape),
+                    "dtype": str(arr.dtype),
+                    "sha": _e497_ln_sha(g),
+                    "suffix": "u16",
+                }
+                with open(os.path.join(_dump, f"{_stem}_dy.json"), "w", encoding="utf-8") as handle:
+                    json.dump(meta, handle, sort_keys=True)
+                    handle.write("\n")
+                return g
+
+            if getattr(y, "stop_gradient", True) is False:
+                y.register_hook(_on_fsln_bin_dy)
+
+            if getattr(x, "stop_gradient", True) is False:
+
+                def _on_fsln_bin_dx(g, *, _dump=dump_bin, _stem=stem, _rank=rank, _base=rec, _call=call):
+                    if g is None:
+                        return g
+                    arr = g.detach().contiguous()
+                    u16 = arr.view(dtype="uint16").cpu().numpy()
+                    u16.tofile(os.path.join(_dump, f"{_stem}_dx.u16.bin"))
+                    meta = {
+                        "framework": "paddle",
+                        "kind": "dx",
+                        "tag": "fsln",
+                        "rank": int(_rank),
+                        "layer": _base["layer"],
+                        "mtp": _base["mtp"],
+                        "call": int(_call),
+                        "shape": list(arr.shape),
+                        "dtype": str(arr.dtype),
+                        "sha": _e497_ln_sha(g),
+                        "suffix": "u16",
+                    }
+                    with open(os.path.join(_dump, f"{_stem}_dx.json"), "w", encoding="utf-8") as handle:
+                        json.dump(meta, handle, sort_keys=True)
+                        handle.write("\n")
+                    return g
+
+                x.register_hook(_on_fsln_bin_dx)
+
+    # E-532 dump-only: live dX of L0 hidden_states (total incoming to the
+    # decoder layer, not ln.Y). Pair with fused embedding prefix dY after
+    # SP gather. Observation; return g unchanged.
+    if dump_dx and getattr(x, "stop_gradient", True) is False:
+
+        def _on_dx(g, *, _dump=dump_dx, _rank=rank, _base=rec):
+            if g is None:
+                return g
+            # E-550: last-stage backbone L2/L3 only (call 5 = step 5).
+            # First-stage L0/L1 already dumped in E-532b. Dumping every
+            # layer as GPU fp32 OOM'd E-532's first attempt.
+            if int(_base["mtp"]) != 0 or int(_base["layer"]) not in (2, 3):
+                return g
+            if int(_base["call"]) != 5:
+                return g
+            import hashlib
+
+            os.makedirs(_dump, exist_ok=True)
+            hit_key = f"{_rank}|{_base['layer']}|{_base['mtp']}"
+            _E532_LN_DX_HITS[hit_key] = _E532_LN_DX_HITS.get(hit_key, 0) + 1
+            hit = _E532_LN_DX_HITS[hit_key]
+            dx = g.detach().cpu().astype("float32").numpy()
+            stem = (
+                f"paddle_ln_dx_r{_rank}_L{_base['layer']}_m{_base['mtp']}"
+                f"_c{_base['call']}_h{hit}"
+            )
+            dx.tofile(os.path.join(_dump, f"{stem}.f32.bin"))
+            meta = {
+                "framework": "paddle",
+                "rank": int(_rank),
+                "layer": _base["layer"],
+                "mtp": _base["mtp"],
+                "call": _base["call"],
+                "hit": int(hit),
+                "dx_shape": list(dx.shape),
+                "dx_sha256": hashlib.sha256(dx.tobytes()).hexdigest(),
+            }
+            with open(
+                os.path.join(_dump, f"{stem}.json"), "w", encoding="utf-8"
+            ) as handle:
+                json.dump(meta, handle, sort_keys=True)
+                handle.write("\n")
+            print(
+                f"[LN-DX-DUMP] r{_rank} L{_base['layer']} mtp={_base['mtp']} "
+                f"c={_base['call']} h={hit} shape={tuple(dx.shape)} "
+                f"sha={meta['dx_sha256'][:16]}",
+                flush=True,
+            )
+            return g
+
+        x.register_hook(_on_dx)
 from paddlefleet.tensor_parallel import RecomputeWithoutOutput
 from paddlefleet.transformer.dsv4_hybrid_attention import DSv4HybridAttention
 from paddlefleet.transformer.identity_op import IdentityFuncOp, IdentityOp
@@ -343,6 +683,11 @@ class TransformerLayer(nn.Layer):
             self.mlp.set_layer_number(
                 self.layer_number, is_mtp_layer=self.is_mtp_layer
             )
+        else:
+            # Dense MLP has no set_layer_number (MoE-only). Stamp for dump-off
+            # first-stage L0 Linear+SwiGLU bins (E-593).
+            self.mlp.layer_number = self.layer_number
+            self.mlp.is_mtp_layer = self.is_mtp_layer
 
         # [Layer 9: BiasDropoutFusion]
         self.mlp_bda = build_spec_layer(sublayers_spec.mlp_bda)
@@ -1264,6 +1609,13 @@ class TransformerLayer(nn.Layer):
             )
         else:
             input_layernorm_output = self.input_layernorm(hidden_states)
+        _e497_ln_record(
+            hidden_states,
+            input_layernorm_output,
+            getattr(self.input_layernorm, "weight", None),
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
 
         self._log_md5(
             input_layernorm_output, "input_layernorm_out", self.layer_number
@@ -1353,6 +1705,29 @@ class TransformerLayer(nn.Layer):
                     residual,
                     self.hidden_dropout_prob,
                 )
+                from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+
+                _attn_y = (
+                    attention_output_with_bias[0]
+                    if isinstance(attention_output_with_bias, tuple)
+                    else attention_output_with_bias
+                )
+                _e497_qa_record(
+                    "bda",
+                    _attn_y,
+                    hidden_states,
+                    None,
+                    getattr(self, "layer_number", -1),
+                    getattr(self, "is_mtp_layer", False),
+                )
+                _e497_qa_record(
+                    "res",
+                    residual,
+                    hidden_states,
+                    None,
+                    getattr(self, "layer_number", -1),
+                    getattr(self, "is_mtp_layer", False),
+                )
 
         # Residual connection.
         residual = hidden_states
@@ -1418,6 +1793,16 @@ class TransformerLayer(nn.Layer):
             post_attention_layernorm_output = self.post_attention_layernorm(
                 hidden_states
             )
+            from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+
+            _e497_qa_record(
+                "postn",
+                hidden_states,
+                post_attention_layernorm_output,
+                getattr(self.post_attention_layernorm, "weight", None),
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
 
         self._log_md5(
             post_attention_layernorm_output,
@@ -1470,6 +1855,21 @@ class TransformerLayer(nn.Layer):
                 )
             else:
                 mlp_output_with_bias = self.mlp(post_attention_layernorm_output)
+            from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+
+            _mlp_y = (
+                mlp_output_with_bias[0]
+                if isinstance(mlp_output_with_bias, tuple)
+                else mlp_output_with_bias
+            )
+            _e497_qa_record(
+                "mlp",
+                post_attention_layernorm_output,
+                _mlp_y,
+                None,
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
 
         # Log MLP raw output before BDA
         if (
@@ -1499,6 +1899,21 @@ class TransformerLayer(nn.Layer):
                     mlp_output_with_bias,
                     residual,
                     self.hidden_dropout_prob,
+                )
+                from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+
+                _mlp_y = (
+                    mlp_output_with_bias[0]
+                    if isinstance(mlp_output_with_bias, tuple)
+                    else mlp_output_with_bias
+                )
+                _e497_qa_record(
+                    "mlpbda",
+                    _mlp_y,
+                    hidden_states,
+                    None,
+                    getattr(self, "layer_number", -1),
+                    getattr(self, "is_mtp_layer", False),
                 )
 
         if is_first_fwd:

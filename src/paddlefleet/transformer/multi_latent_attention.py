@@ -188,6 +188,362 @@ def build_hysparse_valid_range(
 _ACCURACY_COMPATIBLE_KERNEL: bool = (
     os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
 )
+
+# [E497-QA-XY-HASH] hash-only X/Y/dY/W for q_a and kv_a. Hook returns g.
+_E497_QA_CALLS: dict[str, int] = {}
+
+
+def _e497_qa_sha(t, *, t01: bool = False, t2d: bool = False) -> str:
+    import hashlib
+
+    x = t.detach()
+    if t01 and x.ndim == 3:
+        x = x.transpose([1, 0, 2])
+    elif t01 and x.ndim == 4:
+        x = x.transpose([1, 0, 2, 3])
+    elif t2d and x.ndim == 2:
+        x = x.transpose([1, 0])
+    x = x.contiguous()
+    if "bfloat16" in str(x.dtype):
+        buf = x.view(dtype="uint16").cpu().numpy().tobytes()
+    else:
+        buf = x.cpu().numpy().tobytes()
+    return hashlib.sha256(buf).hexdigest()
+
+
+def _e537_dump_oproj_bin(tag, kind, tensor, rec, rank, dump):
+    """CPU dump of last-stage call-5 oproj/core/fln/lmh operands. Observation only."""
+    fln_only = bool(os.environ.get("MODEL_REPRO_FLN_BIN_DIR"))
+    kv_only = bool(os.environ.get("MODEL_REPRO_KV_BIN_DIR"))
+    if fln_only:
+        allowed = ("fln", "lmh", "hnorm", "ehproj")
+    elif kv_only:
+        # E-553: last-stage call-5 qabs/vup/kvaln operands for K-absorb vs
+        # V-deabsorb reconstruction of SP-local kvaln.dY. Observation only.
+        allowed = ("qabs", "vup", "kvaln")
+    else:
+        allowed = ("oproj", "core", "fln", "lmh")
+    if tag not in allowed or tensor is None:
+        return
+    # lmh.W is a 77440x6144 vocab shard (~951MiB). Default skip; E-540 GEMM
+    # isolate sets MODEL_REPRO_DUMP_LMH_W=1 because call-5 W != step-0 ckpt.
+    if tag == "lmh" and kind == "w" and os.environ.get("MODEL_REPRO_DUMP_LMH_W") != "1":
+        return
+    layer = int(rec.get("layer") if rec.get("layer") is not None else -1)
+    call = int(rec.get("call") or 0)
+    mtp = int(rec.get("mtp") or 0)
+    if tag == "hnorm":
+        if mtp != 1 or call != 5:
+            return
+    elif tag == "ehproj":
+        if mtp != 1 or call != 5:
+            return
+    else:
+        if mtp != 0 or call != 5:
+            return
+        if tag in ("oproj", "core", "qabs", "vup", "kvaln") and layer != 3:
+            return
+        if tag in ("fln", "lmh") and layer != -1:
+            return
+    if int(rank) not in (2, 3):
+        return
+    import json
+
+    x = tensor.detach().contiguous()
+    if "bfloat16" in str(x.dtype):
+        buf = x.view(dtype="uint16").cpu().numpy()
+        suffix = "bf16"
+    else:
+        buf = x.cast("float32").cpu().numpy()
+        suffix = "f32"
+    os.makedirs(dump, exist_ok=True)
+    stem = f"paddle_{tag}_r{rank}_c{rec['call']}_L{rec['layer']}_{kind}"
+    buf.tofile(os.path.join(dump, f"{stem}.{suffix}.bin"))
+    meta = {
+        "framework": "paddle",
+        "tag": tag,
+        "kind": kind,
+        "rank": int(rank),
+        "call": int(rec["call"]),
+        "layer": int(rec["layer"]),
+        "mtp": int(rec["mtp"]),
+        "shape": list(x.shape),
+        "dtype": str(x.dtype),
+        "suffix": suffix,
+        "nbytes": int(buf.nbytes),
+    }
+    with open(os.path.join(dump, f"{stem}.json"), "w", encoding="utf-8") as stream:
+        json.dump(meta, stream, sort_keys=True)
+        stream.write("\n")
+    if not getattr(_e537_dump_oproj_bin, "_announced", False):
+        print(f"[E537-OPROJ-BIN] dir={dump} rank={rank} {stem}", flush=True)
+        _e537_dump_oproj_bin._announced = True
+
+
+def _e497_qa_record(tag, x, y, w, layer, mtp) -> None:
+    dump = os.environ.get("MODEL_REPRO_QA_XY_HASH_DIR")
+    bindump = (
+        os.environ.get("MODEL_REPRO_FLN_BIN_DIR")
+        or os.environ.get("MODEL_REPRO_OPROJ_BIN_DIR")
+        or os.environ.get("MODEL_REPRO_KV_BIN_DIR")
+    )
+    dump_mtpbda = os.environ.get("MODEL_REPRO_MTPBDA_HASH_DIR")
+    dump_mtpout = os.environ.get("MODEL_REPRO_MTPOUT_HASH_DIR")
+    dump_fsres = os.environ.get("MODEL_REPRO_FSRES_BIN_DIR")
+    if (not dump and not bindump and not dump_mtpbda and not dump_mtpout and not dump_fsres) or y is None:
+        return
+    import json
+
+    import paddle.distributed as dist
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    key = f"{tag}|{layer}|{int(bool(mtp))}|{rank}"
+    _E497_QA_CALLS[key] = _E497_QA_CALLS.get(key, 0) + 1
+    call = _E497_QA_CALLS[key]
+    if dump:
+        os.makedirs(dump, exist_ok=True)
+    if not getattr(_e497_qa_record, "_announced", False):
+        print(f"[E497-QA-XY-HASH] dir={dump} bindump={bindump} rank={rank}", flush=True)
+        _e497_qa_record._announced = True
+    rec = {
+        "kind": "fwd",
+        "tag": tag,
+        "layer": int(layer) if layer is not None else -1,
+        "mtp": int(bool(mtp)),
+        "rank": int(rank),
+        "call": int(call),
+        "shape_x": list(x.shape),
+        "dtype_x": str(x.dtype),
+        "shape_y": list(y.shape),
+        "dtype_y": str(y.dtype),
+        "shape_w": list(w.shape) if w is not None else None,
+        "dtype_w": str(w.dtype) if w is not None else None,
+    }
+    if dump:
+        rec["sha_x"] = _e497_qa_sha(x)
+        rec["sha_x_t01"] = _e497_qa_sha(x, t01=True) if x.ndim in (3, 4) else None
+        rec["sha_y"] = _e497_qa_sha(y)
+        rec["sha_y_t01"] = _e497_qa_sha(y, t01=True) if y.ndim in (3, 4) else None
+        rec["sha_w"] = _e497_qa_sha(w) if w is not None else None
+        rec["sha_w_T"] = (
+            _e497_qa_sha(w, t2d=True) if w is not None and w.ndim == 2 else None
+        )
+        rec["sha_w_bf16"] = (
+            _e497_qa_sha(w.detach().astype("bfloat16")) if w is not None else None
+        )
+    if dump:
+        with open(os.path.join(dump, f"rank{rank}.jsonl"), "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    if bindump:
+        _e537_dump_oproj_bin(tag, "x", x, rec, rank, bindump)
+        _e537_dump_oproj_bin(tag, "y", y, rec, rank, bindump)
+        if w is not None:
+            _e537_dump_oproj_bin(tag, "w", w, rec, rank, bindump)
+
+    def _on_dy(g, *, _dump=dump, _bindump=bindump, _rank=rank, _base=rec):
+        if g is None:
+            return g
+        bwd = {
+            "kind": "bwd",
+            "tag": _base["tag"],
+            "layer": _base["layer"],
+            "mtp": _base["mtp"],
+            "rank": _rank,
+            "call": _base["call"],
+            "shape_dy": list(g.shape),
+            "dtype_dy": str(g.dtype),
+        }
+        if _dump:
+            bwd["sha_dy"] = _e497_qa_sha(g)
+            bwd["sha_dy_t01"] = (
+                _e497_qa_sha(g, t01=True) if g.ndim in (3, 4) else None
+            )
+        if _dump:
+            with open(os.path.join(_dump, f"rank{_rank}.jsonl"), "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(bwd, ensure_ascii=False) + "\n")
+        if _bindump:
+            _e537_dump_oproj_bin(_base["tag"], "dy", g, _base, _rank, _bindump)
+        return g
+
+    if getattr(y, "stop_gradient", True) is False:
+        y.register_hook(_on_dy)
+
+    # E-569: dump-off MTP transformer post-LN bda (attn residual) vs mlp.
+    # Separate env from QA_XY. Last-stage MTP only.
+    _is_mtp = bool(mtp) or (int(rec["layer"]) == 1 and int(rank) in (2, 3))
+    if dump_mtpbda and _is_mtp and tag in ("bda", "mlp", "postn", "mlpbda"):
+        os.makedirs(dump_mtpbda, exist_ok=True)
+        if not getattr(_e497_qa_record, "_mtpbda_announced", False):
+            print(f"[E569-MTPBDA-HASH] dir={dump_mtpbda} rank={rank} tag={tag}", flush=True)
+            _e497_qa_record._mtpbda_announced = True
+        slim = {
+            "kind": "fwd",
+            "tag": tag,
+            "layer": rec["layer"],
+            "mtp": rec["mtp"],
+            "rank": int(rank),
+            "call": rec["call"],
+            "shape_x": rec["shape_x"],
+            "shape_y": rec["shape_y"],
+            "sha_x": _e497_qa_sha(x),
+            "sha_y": _e497_qa_sha(y),
+        }
+        with open(os.path.join(dump_mtpbda, f"rank{rank}.jsonl"), "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(slim, ensure_ascii=False) + "\n")
+
+        def _on_mtpbda_dy(g, *, _dump=dump_mtpbda, _rank=rank, _base=rec):
+            if g is None:
+                return g
+            bwd = {
+                "kind": "bwd",
+                "tag": _base["tag"],
+                "layer": _base["layer"],
+                "mtp": _base["mtp"],
+                "rank": int(_rank),
+                "call": _base["call"],
+                "shape_dy": list(g.shape),
+                "sha_dy": _e497_qa_sha(g),
+            }
+            with open(os.path.join(_dump, f"rank{_rank}.jsonl"), "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(bwd, ensure_ascii=False) + "\n")
+            return g
+
+        if getattr(y, "stop_gradient", True) is False:
+            y.register_hook(_on_mtpbda_dy)
+
+    # E-584/E-585: dump-off first-stage L0 residual skip / oproj / bda
+    # call-5 uint16 bins. residual.X == L0 LN.X; residual.dY is extra
+    # incoming g on LN.X. E-585 also dumps oproj/bda to name res.dY
+    # producer. Paddle first-stage L0 is layer=0 mtp=0 ranks 0/1.
+    _is_fsres = (
+        tag
+        in (
+            "res",
+            "oproj",
+            "bda",
+            "core",
+            "qabs",
+            "vup",
+            "postn",
+            "mlp",
+            "mlpbda",
+            "moeprobs",
+            "moerouted",
+            "moeshared",
+            "mlpfc1",
+            "mlpglu",
+            "mlpfc2",
+        )
+        and (not bool(mtp))
+        and (
+            int(rank) in (0, 1)
+            or (int(rank) in (2, 3) and int(rec["layer"]) == 2)
+            or (
+                int(rank) in (2, 3)
+                and int(rec["layer"]) == 3
+                and tag in ("res", "oproj", "postn", "mlpbda", "core", "qabs", "vup")
+            )
+        )
+    )
+    if dump_fsres and _is_fsres and int(call) == 5:
+        os.makedirs(dump_fsres, exist_ok=True)
+        if not getattr(_e497_qa_record, "_fsres_announced", False):
+            print(f"[E603-LSL3] dir={dump_fsres} rank={rank} tag={tag} layer={rec['layer']}", flush=True)
+            _e497_qa_record._fsres_announced = True
+
+        def _e584_write_u16(stem, t, kind, *, _dump=dump_fsres, _rank=rank, _base=rec, _call=call):
+            # L3 MoE mlp.Y can be an empty-storage view (numel>0, memory_size=0).
+            # Skip rather than crash the dump-off 6-step.
+            if t is None:
+                return
+            try:
+                arr = t.detach().contiguous()
+                u16 = arr.view(dtype="uint16").cpu().numpy()
+            except Exception as exc:
+                print(
+                    f"[E602-LSL3-SKIP] stem={stem} kind={kind} err={type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                return
+            u16.tofile(os.path.join(_dump, f"{stem}.u16.bin"))
+            meta = {
+                "framework": "paddle",
+                "kind": kind,
+                "tag": _base["tag"],
+                "rank": int(_rank),
+                "layer": _base["layer"],
+                "mtp": _base["mtp"],
+                "call": int(_call),
+                "shape": list(arr.shape),
+                "dtype": str(arr.dtype),
+                "sha": _e497_qa_sha(t),
+                "suffix": "u16",
+            }
+            with open(os.path.join(_dump, f"{stem}.json"), "w", encoding="utf-8") as handle:
+                json.dump(meta, handle, sort_keys=True)
+                handle.write("\n")
+
+        stem = f"paddle_{tag}_r{rank}_c{call}_L{rec['layer']}"
+        _e584_write_u16(f"{stem}_x", x, "x")
+        _e584_write_u16(f"{stem}_y", y, "y")
+        if w is not None and tag in ("oproj", "qabs", "vup", "postn", "mlpfc1", "mlpfc2"):
+            _e584_write_u16(f"{stem}_w", w, "w")
+
+        def _on_fsres_dy(g, *, _dump=dump_fsres, _stem=stem, _rank=rank, _base=rec, _call=call):
+            if g is None:
+                return g
+            arr = g.detach().contiguous()
+            u16 = arr.view(dtype="uint16").cpu().numpy()
+            u16.tofile(os.path.join(_dump, f"{_stem}_dy.u16.bin"))
+            meta = {
+                "framework": "paddle",
+                "kind": "dy",
+                "tag": _base["tag"],
+                "rank": int(_rank),
+                "layer": _base["layer"],
+                "mtp": _base["mtp"],
+                "call": int(_call),
+                "shape": list(arr.shape),
+                "dtype": str(arr.dtype),
+                "sha": _e497_qa_sha(g),
+                "suffix": "u16",
+            }
+            with open(os.path.join(_dump, f"{_stem}_dy.json"), "w", encoding="utf-8") as handle:
+                json.dump(meta, handle, sort_keys=True)
+                handle.write("\n")
+            return g
+
+        if getattr(y, "stop_gradient", True) is False:
+            y.register_hook(_on_fsres_dy)
+        if getattr(x, "stop_gradient", True) is False:
+
+            def _on_fsres_dx(g, *, _dump=dump_fsres, _stem=stem, _rank=rank, _base=rec, _call=call):
+                if g is None:
+                    return g
+                arr = g.detach().contiguous()
+                u16 = arr.view(dtype="uint16").cpu().numpy()
+                u16.tofile(os.path.join(_dump, f"{_stem}_dx.u16.bin"))
+                meta = {
+                    "framework": "paddle",
+                    "kind": "dx",
+                    "tag": _base["tag"],
+                    "rank": int(_rank),
+                    "layer": _base["layer"],
+                    "mtp": _base["mtp"],
+                    "call": int(_call),
+                    "shape": list(arr.shape),
+                    "dtype": str(arr.dtype),
+                    "sha": _e497_qa_sha(g),
+                    "suffix": "u16",
+                }
+                with open(os.path.join(_dump, f"{_stem}_dx.json"), "w", encoding="utf-8") as handle:
+                    json.dump(meta, handle, sort_keys=True)
+                    handle.write("\n")
+                return g
+
+            x.register_hook(_on_fsres_dx)
+
+
 # Dedicated env for the torch-aligned absorbed-MLA core (rounds 10-13): lets the
 # absorbed branch run WITHOUT the engine-wide FLAGS_* acc flag (which would
 # re-route the whole network's kernels away from the bit-exact path).
@@ -1267,6 +1623,14 @@ class MultiLatentAttention(Attention):
             bias = None
         else:
             output, bias = self.o_proj(core_attn_out)
+            _e497_qa_record(
+                "oproj",
+                core_attn_out,
+                output,
+                getattr(self.o_proj, "weight", None),
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
 
         if self.gated_attention and self.recompute_gated_attn:
             gate_recompute.discard_output_and_register_recompute(output)
@@ -1943,6 +2307,14 @@ class MLASelfAttention(MultiLatentAttention):
                 )
             else:
                 q_compressed, _ = self.q_a_proj(hidden_states)
+            _e497_qa_record(
+                "qa",
+                hidden_states,
+                q_compressed,
+                getattr(self.q_a_proj, "weight", None),
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
 
             # When output is sharded (ColumnParallelLinear):
             # Gather output to restore output dim q_lora_rank;
@@ -1961,6 +2333,14 @@ class MLASelfAttention(MultiLatentAttention):
         # if kv_a_proj_with_mqa is ColumnParallelLinear:
         #     kv_combined: [b, s, (kv_lora_rank + qk_rope_head_dim) / TP]
         kv_combined, _ = self.kv_a_proj_with_mqa(hidden_states)
+        _e497_qa_record(
+            "kva",
+            hidden_states,
+            kv_combined,
+            getattr(self.kv_a_proj_with_mqa, "weight", None),
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
         if kv_combined.size(-1) != self.kv_lora_rank + self.qk_rope_head_dim:
             # kv_combined: [b, s, (kv_lora_rank + qk_rope_head_dim)]
             kv_combined = gather_from_tensor_model_parallel_region(kv_combined)
@@ -2005,9 +2385,27 @@ class MLASelfAttention(MultiLatentAttention):
 
         if self.q_lora_rank is not None:
             # q_compressed: [num_tokens, q_lora_rank]
+            _qaln_x = q_compressed
             q_compressed = self.q_a_layernorm(q_compressed)
+            _e497_qa_record(
+                "qaln",
+                _qaln_x,
+                q_compressed,
+                getattr(self.q_a_layernorm, "weight", None),
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
 
+        _kvaln_x = kv_compressed
         kv_compressed = self.kv_a_layernorm(kv_compressed)
+        _e497_qa_record(
+            "kvaln",
+            _kvaln_x,
+            kv_compressed,
+            getattr(self.kv_a_layernorm, "weight", None),
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
 
         # === MD5 probes for MLA intermediate values ===
         from paddlefleet.transformer.transformer_layer import TransformerLayer
@@ -2040,6 +2438,14 @@ class MLASelfAttention(MultiLatentAttention):
                 # q_compressed: [num_tokens, q_lora_rank]
                 # q: [num_tokens, n * (qk_nope_head_dim + qk_rope_head_dim)]
                 q, _ = self.q_b_proj(q_compressed)
+                _e497_qa_record(
+                    "qup",
+                    q_compressed,
+                    q,
+                    getattr(self.q_b_proj, "weight", None),
+                    getattr(self, "layer_number", -1),
+                    getattr(self, "is_mtp_layer", False),
+                )
             else:
                 # q_compressed: [num_tokens, hidden_size]
                 # q: [num_tokens, n * (qk_nope_head_dim + qk_rope_head_dim)]
@@ -2050,6 +2456,14 @@ class MLASelfAttention(MultiLatentAttention):
                 *q.size()[:-1],
                 self.num_attention_heads_per_partition,
                 self.q_head_dim,
+            )
+            _e497_qa_record(
+                "qview",
+                q,
+                q,
+                None,
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
             )
 
             # kv: [num_tokens, n * (qk_nope_head_dim + v_head_dim)]
@@ -2235,6 +2649,14 @@ class MLASelfAttention(MultiLatentAttention):
                 # Replace paddle.split with zero-copy slice views.
                 q_no_pe = q[..., : self.qk_nope_head_dim]
                 q_pos_emb = q[..., self.qk_nope_head_dim :]
+                _e497_qa_record(
+                    "qnope",
+                    q,
+                    q_no_pe,
+                    None,
+                    getattr(self, "layer_number", -1),
+                    getattr(self, "is_mtp_layer", False),
+                )
 
                 # k_no_pe: [num_tokens, n, qk_nope_head_dim]
                 # value: [num_tokens, n, v_head_dim]
@@ -2369,6 +2791,7 @@ class MLASelfAttention(MultiLatentAttention):
                     k_rope_fused_with_cat = True
                 else:
                     # q_pos_emb: [num_tokens, n, qk_rope_head_dim]
+                    _qpe_x = q_pos_emb
                     q_pos_emb = apply_rotary_pos_emb(
                         q_pos_emb,
                         rotary_pos_emb,
@@ -2380,6 +2803,14 @@ class MLASelfAttention(MultiLatentAttention):
                         cp_group=self.pg_collection.cp,
                         apply_rope_fusion=bool(self.config.apply_rope_fusion)
                         and not self.mqa_latent,
+                    )
+                    _e497_qa_record(
+                        "qrope",
+                        _qpe_x,
+                        q_pos_emb,
+                        None,
+                        getattr(self, "layer_number", -1),
+                        getattr(self, "is_mtp_layer", False),
                     )
                     # k_pos_emb:[num_tokens, 1, qk_rope_head_dim]
                     k_pos_emb = apply_rotary_pos_emb(
@@ -3016,6 +3447,14 @@ class MQASelfAttention(MLASelfAttention):
         core_attn_out += sparse_core_attn_out
 
         output, bias = self.o_proj(core_attn_out)
+        _e497_qa_record(
+            "oproj",
+            core_attn_out,
+            output,
+            getattr(self.o_proj, "weight", None),
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
 
         _log(output, "attn_o_proj_out", layer_num)
 
@@ -3092,11 +3531,27 @@ class MQASelfAttention(MLASelfAttention):
         # =========================================
         if self.config.q_lora_rank is not None:
             q_compressed, _ = self.q_a_proj(hidden_states)
+            _e497_qa_record(
+                "qa",
+                hidden_states,
+                q_compressed,
+                getattr(self.q_a_proj, "weight", None),
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
         else:
             q_compressed = hidden_states
 
         # kv_combined: [b, s, (kv_lora_rank + qk_rope_head_dim)]
         kv_combined, _ = self.kv_a_proj_with_mqa(hidden_states)
+        _e497_qa_record(
+            "kva",
+            hidden_states,
+            kv_combined,
+            getattr(self.kv_a_proj_with_mqa, "weight", None),
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
 
         # kv_compressed: [b, s, kv_lora_rank], k_pos_emb: [b, s, qk_rope_head_dim]
         kv_compressed, k_pos_emb = paddle.split(
@@ -3111,9 +3566,27 @@ class MQASelfAttention(MLASelfAttention):
 
         if self.config.q_lora_rank is not None:
             # q_compressed: [num_tokens, q_lora_rank]
+            _qaln_x = q_compressed
             q_compressed = self.q_a_layernorm(q_compressed)
+            _e497_qa_record(
+                "qaln",
+                _qaln_x,
+                q_compressed,
+                getattr(self.q_a_layernorm, "weight", None),
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
 
+        _kvaln_x = kv_compressed
         kv_compressed = self.kv_a_layernorm(kv_compressed)
+        _e497_qa_record(
+            "kvaln",
+            _kvaln_x,
+            kv_compressed,
+            getattr(self.kv_a_layernorm, "weight", None),
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
 
         # === MD5 probes for MLA intermediate values ===
         from paddlefleet.transformer.transformer_layer import TransformerLayer
@@ -3146,6 +3619,14 @@ class MQASelfAttention(MLASelfAttention):
                 # q_compressed: [num_tokens, q_lora_rank]
                 # q: [num_tokens, n * (qk_nope_head_dim + qk_rope_head_dim)]
                 q, _ = self.q_b_proj(q_compressed)
+                _e497_qa_record(
+                    "qup",
+                    q_compressed,
+                    q,
+                    getattr(self.q_b_proj, "weight", None),
+                    getattr(self, "layer_number", -1),
+                    getattr(self, "is_mtp_layer", False),
+                )
             else:
                 # q_compressed: [num_tokens, hidden_size]
                 # q: [num_tokens, n * (qk_nope_head_dim + qk_rope_head_dim)]

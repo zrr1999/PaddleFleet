@@ -60,6 +60,7 @@
 #     produce identical math at step 0 (params init to zero -> SegLU = id).
 # =============================================================================
 
+import os
 import warnings
 
 import paddle
@@ -318,9 +319,39 @@ class GPTLMHead(ColumnParallelLinear):
             logits = [self._forward(tensor_list[0])]
             for i in range(self.config.num_nextn_predict_layers):
                 logits.append(self._forward(tensor_list[i + 1]))
+            if os.environ.get("MODEL_REPRO_QA_XY_HASH_DIR") or os.environ.get(
+                "MODEL_REPRO_FLN_BIN_DIR"
+            ):
+                from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+
+                y0 = logits[0]
+                if y0 is not None and not isinstance(y0, tuple):
+                    _e497_qa_record(
+                        "lmh",
+                        tensor_list[0],
+                        y0,
+                        getattr(self, "weight", None),
+                        -1,
+                        False,
+                    )
             return logits
         else:
-            return self._forward(hidden_states)
+            y = self._forward(hidden_states)
+            if os.environ.get("MODEL_REPRO_QA_XY_HASH_DIR") or os.environ.get(
+                "MODEL_REPRO_FLN_BIN_DIR"
+            ):
+                from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+
+                if y is not None and not isinstance(y, tuple):
+                    _e497_qa_record(
+                        "lmh",
+                        hidden_states,
+                        y,
+                        getattr(self, "weight", None),
+                        -1,
+                        False,
+                    )
+            return y
 
     @property
     def embedding_weight(self):
@@ -370,9 +401,25 @@ class GPTMainLMHead(GPTLMHead):
                 hidden_states,
                 self.config.num_nextn_predict_layers + 1,
             )
-            logits = self._forward(tensor_list[0])
+            _lmh_x = tensor_list[0]
+            logits = self._forward(_lmh_x)
         else:
+            _lmh_x = hidden_states
             logits = self._forward(hidden_states)
+        # E-538/E-540: hash/bin main lm_head X/Y (CE incoming).
+        if os.environ.get("MODEL_REPRO_QA_XY_HASH_DIR") or os.environ.get(
+            "MODEL_REPRO_FLN_BIN_DIR"
+        ):
+            from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+
+            _e497_qa_record(
+                "lmh",
+                _lmh_x,
+                logits,
+                getattr(self, "weight", None),
+                -1,
+                False,
+            )
         ret = {
             "logits": logits,
             "mtp_loss": mtp_loss,

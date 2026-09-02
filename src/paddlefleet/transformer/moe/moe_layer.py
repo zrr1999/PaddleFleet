@@ -1387,6 +1387,55 @@ class MoELayer(nn.Layer):
             input_ids=input_ids,
             origin_input_ids=origin_input_ids,
         )
+        from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+        from paddlefleet import utils as _pfutils
+
+        # GatherOp expands [s/tp,b,h] -> [s,b,h]. Hash this TP rank's SP shard
+        # so it pairs with torch's ungathered MoE input. Slice is dump-only.
+        _tp_size = max(_pfutils.get_pg_size(self.pg_collection.tp), 1)
+        _tp_rank = _pfutils.get_pg_rank(self.pg_collection.tp)
+        _slen = int(gate_input.shape[0]) // _tp_size
+        _lo, _hi = _tp_rank * _slen, (_tp_rank + 1) * _slen
+        _e497_qa_record(
+            "moeroute",
+            gate_input[_lo:_hi],
+            topk_weights[_lo:_hi]
+            if topk_weights is not None and topk_weights.shape[0] == gate_input.shape[0]
+            else topk_weights,
+            getattr(self.gate, "e_score_correction_bias", None),
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
+        # Same-layout vs torch: routing_map/probs are [S, E] after gather; hash
+        # the local SP shard so it pairs with torch's ungathered [s/tp, E].
+        # Live mask is float32 0/1 (put_along_axis_), not bool — always recast
+        # to uint8 so the hash matches torch routing_map.uint8.
+        _map = mask[_lo:_hi].cast("uint8")
+        _e497_qa_record(
+            "moemap",
+            gate_input[_lo:_hi],
+            _map,
+            None,
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
+        _e497_qa_record(
+            "moeprobs",
+            gate_input[_lo:_hi],
+            probs[_lo:_hi],
+            None,
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
+        if topk_indices is not None and topk_indices.shape[0] == gate_input.shape[0]:
+            _e497_qa_record(
+                "moetopk",
+                gate_input[_lo:_hi],
+                topk_indices[_lo:_hi],
+                None,
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
         # topk_weights, topk_indices: Shape is [seq_len, moe_router_topk]
         # probs: combine weights in [S, E] sparse layout (non-selected positions are 0) [seq_len, num_experts]
         # mask (routing_map): binary selection matrix [seq_len, num_experts]
@@ -1518,12 +1567,43 @@ class MoELayer(nn.Layer):
 
         output = output.reshape(orig_shape)
         output = self._post_routed_output(output)
+        from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+        from paddlefleet import utils as _pfutils_r
+
+        _tp_size_r = max(_pfutils_r.get_pg_size(self.pg_collection.tp), 1)
+        _tp_rank_r = _pfutils_r.get_pg_rank(self.pg_collection.tp)
+        _slen_r = int(output.shape[0]) // _tp_size_r
+        _lo_r, _hi_r = _tp_rank_r * _slen_r, (_tp_rank_r + 1) * _slen_r
+        _e497_qa_record(
+            "moerouted",
+            residuals[_lo_r:_hi_r],
+            output[_lo_r:_hi_r],
+            None,
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
 
         if self.shared_experts is not None:
             if combine_overlap_handle is not None:
                 shared_output = combine_overlap_handle["fn_out"][0]
             else:
                 shared_output = self.shared_experts(residuals)[0]
+            from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+
+            from paddlefleet import utils as _pfutils
+
+            _tp_size = max(_pfutils.get_pg_size(self.pg_collection.tp), 1)
+            _tp_rank = _pfutils.get_pg_rank(self.pg_collection.tp)
+            _slen = int(residuals.shape[0]) // _tp_size
+            _lo, _hi = _tp_rank * _slen, (_tp_rank + 1) * _slen
+            _e497_qa_record(
+                "moeshared",
+                residuals[_lo:_hi],
+                shared_output[_lo:_hi],
+                None,
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
             shared_output = self._post_shared_output(shared_output)
             _moe_ds_dump2 = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR")
             if _moe_ds_dump2:

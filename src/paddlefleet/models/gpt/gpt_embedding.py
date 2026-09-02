@@ -513,6 +513,19 @@ class GPTEmbedding(FleetLayer):
                     ]
                     inputs_embeds_ori = inputs_embeds
                     batch_size, seq_length, hidden_size = inputs_embeds.shape
+                    two_fp32_uac = os.environ.get(
+                        "MODEL_REPRO_TWO_FP32_ACCUM", ""
+                    ) == "1" and getattr(
+                        self.config, "use_accuracy_compatible", False
+                    )
+                    # E-529: fused 169-id IndexingBackward vs two 168-id
+                    # lookups (E-525). Concat-slice stays the enorm/PP
+                    # forward carrier (do not reopen E-416). Detach those
+                    # windows so the fused 169-id wgrad dies; independent
+                    # main 168-id lookup STE-replaces the backbone.
+                    if two_fp32_uac:
+                        inputs_embeds_ori = inputs_embeds_ori.detach()
+                        inputs_embeds_extra = inputs_embeds_extra.detach()
 
                     if (
                         get_context_parallel_world_size() > 1
@@ -533,6 +546,46 @@ class GPTEmbedding(FleetLayer):
                             inputs_embeds.reshape([batch_size, -1, hidden_size])
                             .permute(1, 0, 2)
                             .contiguous()
+                        )
+                    if two_fp32_uac:
+                        seq_length_ids = (
+                            input_ids.shape[1]
+                            - self.config.num_nextn_predict_layers
+                        )
+                        looked_main = self.embedding(
+                            input_ids=input_ids[:, :seq_length_ids],
+                            position_ids=None,
+                        )
+                        if (
+                            get_context_parallel_world_size() > 1
+                            and self.config.experimental_dataflow
+                        ):
+                            looked_main = ContextParallelScatterOp.apply(
+                                looked_main,
+                                axis=1,
+                                mode=self.config.cp_balance_mode,
+                            )
+                        if self.sequence_parallel:
+                            looked_main = looked_main.reshape(
+                                [-1, looked_main.shape[-1]]
+                            )
+                            looked_main = ScatterOp.apply(looked_main)
+                            looked_main = (
+                                looked_main.reshape(
+                                    [batch_size, -1, hidden_size]
+                                )
+                                .permute(1, 0, 2)
+                                .contiguous()
+                            )
+                        inputs_embeds = inputs_embeds.detach() + (
+                            looked_main - looked_main.detach()
+                        )
+                        print(
+                            "[TWO-FP32-ACCUM] "
+                            "main lookup armed "
+                            f"looked={tuple(looked_main.shape)} "
+                            f"carrier={tuple(inputs_embeds.shape)}",
+                            flush=True,
                         )
                     mtp_emb_res = [inputs_embeds]
                     for depth in range(self.config.num_nextn_predict_layers):

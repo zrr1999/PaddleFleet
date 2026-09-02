@@ -275,6 +275,59 @@ def _initialize_affine_weight_cpu(
     return None
 
 
+_EMBED_IDS_CALL = 0
+
+
+def _dump_embed_lookup_ids(input_, masked_input, input_mask, vocab_start, vocab_end):
+    """Dump-only embedding lookup ids. Observation, not a wrap."""
+    dump = os.environ.get("MODEL_REPRO_EMBED_IDS_DIR")
+    if not dump:
+        return
+    import hashlib
+    import json
+
+    global _EMBED_IDS_CALL
+    _EMBED_IDS_CALL += 1
+    try:
+        rank = int(dist.get_rank()) if dist.is_initialized() else 0
+    except Exception:
+        rank = 0
+    step_env = os.environ.get("MODEL_REPRO_STEP", "")
+    ids = masked_input.detach().cpu().numpy()
+    raw = input_.detach().cpu().numpy()
+    mask = None
+    if input_mask is not None:
+        mask = input_mask.detach().cpu().numpy().astype("uint8")
+    os.makedirs(dump, exist_ok=True)
+    stem = f"paddle_embed_r{rank}_c{_EMBED_IDS_CALL}_L{int(ids.size)}"
+    ids.tofile(os.path.join(dump, f"{stem}_masked.i64.bin"))
+    raw.tofile(os.path.join(dump, f"{stem}_input.i64.bin"))
+    if mask is not None:
+        mask.tofile(os.path.join(dump, f"{stem}_mask.u8.bin"))
+    meta = {
+        "framework": "paddle",
+        "rank": rank,
+        "call": _EMBED_IDS_CALL,
+        "step_env": step_env,
+        "shape": list(ids.shape),
+        "n": int(ids.size),
+        "vocab_start": int(vocab_start),
+        "vocab_end": int(vocab_end),
+        "masked_sha256": hashlib.sha256(ids.tobytes()).hexdigest(),
+        "input_sha256": hashlib.sha256(raw.tobytes()).hexdigest(),
+        "n_oov": int(mask.sum()) if mask is not None else 0,
+        "n_unique_masked": int(len(set(ids.reshape(-1).tolist()))),
+    }
+    with open(os.path.join(dump, f"{stem}.json"), "w", encoding="utf-8") as handle:
+        json.dump(meta, handle, sort_keys=True)
+        handle.write("\n")
+    print(
+        f"[EMBED-IDS-DUMP] r{rank} c{_EMBED_IDS_CALL} n={ids.size} "
+        f"oov={meta['n_oov']} sha={meta['masked_sha256'][:16]}",
+        flush=True,
+    )
+
+
 class _EmbedFp32MainGrad(paddle.autograd.Function):
     """UAC embedding lookup whose wgrad lands in fp32 main_grad.
 
@@ -450,6 +503,14 @@ class VocabParallelEmbedding(paddle.nn.Layer):
             masked_input[input_mask] = 0
         else:
             masked_input = input_
+            input_mask = None
+        _dump_embed_lookup_ids(
+            input_,
+            masked_input,
+            input_mask,
+            self.vocab_start_index,
+            self.vocab_end_index,
+        )
         # Get the embeddings.
         if self.deterministic_mode or self.use_accuracy_compatible:
             if os.environ.get("MODEL_REPRO_TWO_FP32_ACCUM", "") == "1":

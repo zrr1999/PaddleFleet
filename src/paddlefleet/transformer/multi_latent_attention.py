@@ -188,6 +188,94 @@ def build_hysparse_valid_range(
 _ACCURACY_COMPATIBLE_KERNEL: bool = (
     os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
 )
+
+# [E497-QA-XY-HASH] hash-only X/Y/dY/W for q_a and kv_a. Hook returns g.
+_E497_QA_CALLS: dict[str, int] = {}
+
+
+def _e497_qa_sha(t, *, t01: bool = False, t2d: bool = False) -> str:
+    import hashlib
+
+    x = t.detach()
+    if t01 and x.ndim == 3:
+        x = x.transpose([1, 0, 2])
+    elif t01 and x.ndim == 4:
+        x = x.transpose([1, 0, 2, 3])
+    elif t2d and x.ndim == 2:
+        x = x.transpose([1, 0])
+    x = x.contiguous()
+    if "bfloat16" in str(x.dtype):
+        buf = x.view(dtype="uint16").cpu().numpy().tobytes()
+    else:
+        buf = x.cpu().numpy().tobytes()
+    return hashlib.sha256(buf).hexdigest()
+
+
+def _e497_qa_record(tag, x, y, w, layer, mtp) -> None:
+    dump = os.environ.get("MODEL_REPRO_QA_XY_HASH_DIR")
+    if not dump or y is None:
+        return
+    import json
+
+    import paddle.distributed as dist
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    key = f"{tag}|{layer}|{int(bool(mtp))}|{rank}"
+    _E497_QA_CALLS[key] = _E497_QA_CALLS.get(key, 0) + 1
+    call = _E497_QA_CALLS[key]
+    os.makedirs(dump, exist_ok=True)
+    if not getattr(_e497_qa_record, "_announced", False):
+        print(f"[E497-QA-XY-HASH] dir={dump} rank={rank}", flush=True)
+        _e497_qa_record._announced = True
+    rec = {
+        "kind": "fwd",
+        "tag": tag,
+        "layer": int(layer) if layer is not None else -1,
+        "mtp": int(bool(mtp)),
+        "rank": int(rank),
+        "call": int(call),
+        "shape_x": list(x.shape),
+        "dtype_x": str(x.dtype),
+        "sha_x": _e497_qa_sha(x),
+        "sha_x_t01": _e497_qa_sha(x, t01=True) if x.ndim in (3, 4) else None,
+        "shape_y": list(y.shape),
+        "dtype_y": str(y.dtype),
+        "sha_y": _e497_qa_sha(y),
+        "sha_y_t01": _e497_qa_sha(y, t01=True) if y.ndim in (3, 4) else None,
+        "shape_w": list(w.shape) if w is not None else None,
+        "dtype_w": str(w.dtype) if w is not None else None,
+        "sha_w": _e497_qa_sha(w) if w is not None else None,
+        "sha_w_T": _e497_qa_sha(w, t2d=True) if w is not None and w.ndim == 2 else None,
+        "sha_w_bf16": (
+            _e497_qa_sha(w.detach().astype("bfloat16")) if w is not None else None
+        ),
+    }
+    with open(os.path.join(dump, f"rank{rank}.jsonl"), "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    def _on_dy(g, *, _dump=dump, _rank=rank, _base=rec):
+        if g is None:
+            return g
+        bwd = {
+            "kind": "bwd",
+            "tag": _base["tag"],
+            "layer": _base["layer"],
+            "mtp": _base["mtp"],
+            "rank": _rank,
+            "call": _base["call"],
+            "shape_dy": list(g.shape),
+            "dtype_dy": str(g.dtype),
+            "sha_dy": _e497_qa_sha(g),
+            "sha_dy_t01": _e497_qa_sha(g, t01=True) if g.ndim in (3, 4) else None,
+        }
+        with open(os.path.join(_dump, f"rank{_rank}.jsonl"), "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(bwd, ensure_ascii=False) + "\n")
+        return g
+
+    if getattr(y, "stop_gradient", True) is False:
+        y.register_hook(_on_dy)
+
+
 # Dedicated env for the torch-aligned absorbed-MLA core (rounds 10-13): lets the
 # absorbed branch run WITHOUT the engine-wide FLAGS_* acc flag (which would
 # re-route the whole network's kernels away from the bit-exact path).
@@ -1267,6 +1355,14 @@ class MultiLatentAttention(Attention):
             bias = None
         else:
             output, bias = self.o_proj(core_attn_out)
+            _e497_qa_record(
+                "oproj",
+                core_attn_out,
+                output,
+                getattr(self.o_proj, "weight", None),
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
 
         if self.gated_attention and self.recompute_gated_attn:
             gate_recompute.discard_output_and_register_recompute(output)
@@ -1943,6 +2039,14 @@ class MLASelfAttention(MultiLatentAttention):
                 )
             else:
                 q_compressed, _ = self.q_a_proj(hidden_states)
+            _e497_qa_record(
+                "qa",
+                hidden_states,
+                q_compressed,
+                getattr(self.q_a_proj, "weight", None),
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
 
             # When output is sharded (ColumnParallelLinear):
             # Gather output to restore output dim q_lora_rank;
@@ -1961,6 +2065,14 @@ class MLASelfAttention(MultiLatentAttention):
         # if kv_a_proj_with_mqa is ColumnParallelLinear:
         #     kv_combined: [b, s, (kv_lora_rank + qk_rope_head_dim) / TP]
         kv_combined, _ = self.kv_a_proj_with_mqa(hidden_states)
+        _e497_qa_record(
+            "kva",
+            hidden_states,
+            kv_combined,
+            getattr(self.kv_a_proj_with_mqa, "weight", None),
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
         if kv_combined.size(-1) != self.kv_lora_rank + self.qk_rope_head_dim:
             # kv_combined: [b, s, (kv_lora_rank + qk_rope_head_dim)]
             kv_combined = gather_from_tensor_model_parallel_region(kv_combined)
@@ -2005,9 +2117,27 @@ class MLASelfAttention(MultiLatentAttention):
 
         if self.q_lora_rank is not None:
             # q_compressed: [num_tokens, q_lora_rank]
+            _qaln_x = q_compressed
             q_compressed = self.q_a_layernorm(q_compressed)
+            _e497_qa_record(
+                "qaln",
+                _qaln_x,
+                q_compressed,
+                getattr(self.q_a_layernorm, "weight", None),
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
 
+        _kvaln_x = kv_compressed
         kv_compressed = self.kv_a_layernorm(kv_compressed)
+        _e497_qa_record(
+            "kvaln",
+            _kvaln_x,
+            kv_compressed,
+            getattr(self.kv_a_layernorm, "weight", None),
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
 
         # === MD5 probes for MLA intermediate values ===
         from paddlefleet.transformer.transformer_layer import TransformerLayer
@@ -2040,6 +2170,14 @@ class MLASelfAttention(MultiLatentAttention):
                 # q_compressed: [num_tokens, q_lora_rank]
                 # q: [num_tokens, n * (qk_nope_head_dim + qk_rope_head_dim)]
                 q, _ = self.q_b_proj(q_compressed)
+                _e497_qa_record(
+                    "qup",
+                    q_compressed,
+                    q,
+                    getattr(self.q_b_proj, "weight", None),
+                    getattr(self, "layer_number", -1),
+                    getattr(self, "is_mtp_layer", False),
+                )
             else:
                 # q_compressed: [num_tokens, hidden_size]
                 # q: [num_tokens, n * (qk_nope_head_dim + qk_rope_head_dim)]
@@ -2050,6 +2188,14 @@ class MLASelfAttention(MultiLatentAttention):
                 *q.size()[:-1],
                 self.num_attention_heads_per_partition,
                 self.q_head_dim,
+            )
+            _e497_qa_record(
+                "qview",
+                q,
+                q,
+                None,
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
             )
 
             # kv: [num_tokens, n * (qk_nope_head_dim + v_head_dim)]
@@ -2235,6 +2381,14 @@ class MLASelfAttention(MultiLatentAttention):
                 # Replace paddle.split with zero-copy slice views.
                 q_no_pe = q[..., : self.qk_nope_head_dim]
                 q_pos_emb = q[..., self.qk_nope_head_dim :]
+                _e497_qa_record(
+                    "qnope",
+                    q,
+                    q_no_pe,
+                    None,
+                    getattr(self, "layer_number", -1),
+                    getattr(self, "is_mtp_layer", False),
+                )
 
                 # k_no_pe: [num_tokens, n, qk_nope_head_dim]
                 # value: [num_tokens, n, v_head_dim]
@@ -2369,6 +2523,7 @@ class MLASelfAttention(MultiLatentAttention):
                     k_rope_fused_with_cat = True
                 else:
                     # q_pos_emb: [num_tokens, n, qk_rope_head_dim]
+                    _qpe_x = q_pos_emb
                     q_pos_emb = apply_rotary_pos_emb(
                         q_pos_emb,
                         rotary_pos_emb,
@@ -2380,6 +2535,14 @@ class MLASelfAttention(MultiLatentAttention):
                         cp_group=self.pg_collection.cp,
                         apply_rope_fusion=bool(self.config.apply_rope_fusion)
                         and not self.mqa_latent,
+                    )
+                    _e497_qa_record(
+                        "qrope",
+                        _qpe_x,
+                        q_pos_emb,
+                        None,
+                        getattr(self, "layer_number", -1),
+                        getattr(self, "is_mtp_layer", False),
                     )
                     # k_pos_emb:[num_tokens, 1, qk_rope_head_dim]
                     k_pos_emb = apply_rotary_pos_emb(
@@ -3016,6 +3179,14 @@ class MQASelfAttention(MLASelfAttention):
         core_attn_out += sparse_core_attn_out
 
         output, bias = self.o_proj(core_attn_out)
+        _e497_qa_record(
+            "oproj",
+            core_attn_out,
+            output,
+            getattr(self.o_proj, "weight", None),
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
 
         _log(output, "attn_o_proj_out", layer_num)
 
@@ -3092,11 +3263,27 @@ class MQASelfAttention(MLASelfAttention):
         # =========================================
         if self.config.q_lora_rank is not None:
             q_compressed, _ = self.q_a_proj(hidden_states)
+            _e497_qa_record(
+                "qa",
+                hidden_states,
+                q_compressed,
+                getattr(self.q_a_proj, "weight", None),
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
         else:
             q_compressed = hidden_states
 
         # kv_combined: [b, s, (kv_lora_rank + qk_rope_head_dim)]
         kv_combined, _ = self.kv_a_proj_with_mqa(hidden_states)
+        _e497_qa_record(
+            "kva",
+            hidden_states,
+            kv_combined,
+            getattr(self.kv_a_proj_with_mqa, "weight", None),
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
 
         # kv_compressed: [b, s, kv_lora_rank], k_pos_emb: [b, s, qk_rope_head_dim]
         kv_compressed, k_pos_emb = paddle.split(
@@ -3111,9 +3298,27 @@ class MQASelfAttention(MLASelfAttention):
 
         if self.config.q_lora_rank is not None:
             # q_compressed: [num_tokens, q_lora_rank]
+            _qaln_x = q_compressed
             q_compressed = self.q_a_layernorm(q_compressed)
+            _e497_qa_record(
+                "qaln",
+                _qaln_x,
+                q_compressed,
+                getattr(self.q_a_layernorm, "weight", None),
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
 
+        _kvaln_x = kv_compressed
         kv_compressed = self.kv_a_layernorm(kv_compressed)
+        _e497_qa_record(
+            "kvaln",
+            _kvaln_x,
+            kv_compressed,
+            getattr(self.kv_a_layernorm, "weight", None),
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
 
         # === MD5 probes for MLA intermediate values ===
         from paddlefleet.transformer.transformer_layer import TransformerLayer
@@ -3146,6 +3351,14 @@ class MQASelfAttention(MLASelfAttention):
                 # q_compressed: [num_tokens, q_lora_rank]
                 # q: [num_tokens, n * (qk_nope_head_dim + qk_rope_head_dim)]
                 q, _ = self.q_b_proj(q_compressed)
+                _e497_qa_record(
+                    "qup",
+                    q_compressed,
+                    q,
+                    getattr(self.q_b_proj, "weight", None),
+                    getattr(self, "layer_number", -1),
+                    getattr(self, "is_mtp_layer", False),
+                )
             else:
                 # q_compressed: [num_tokens, hidden_size]
                 # q: [num_tokens, n * (qk_nope_head_dim + qk_rope_head_dim)]

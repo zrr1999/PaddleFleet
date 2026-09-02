@@ -25,6 +25,7 @@ This module provides:
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -108,14 +109,14 @@ class _AccuracyCompatibleSoftmax(paddle.autograd.PyLayer):
 
     @staticmethod
     def forward(ctx, logits: Tensor) -> Tensor:
-        attn_weights = paddle.exp(
-            logits - paddle.max(logits, axis=-1, keepdim=True)
-        )
+        # Why: E-519 dumped equal Q/K/mask/scores at step-5 L0 S=168; the
+        # exp-max-div formula disagrees with F.softmax / torch.softmax by 1
+        # ulp (152606/903168). Steps 1-4 S<=92 still match. Default path
+        # stays F.softmax in _unfused_dsa_attention. Backward formula
+        # unchanged.
         invalid = logits == float("-inf")
+        attn_weights = F.softmax(logits, axis=-1)
         zeros = paddle.zeros([], dtype=attn_weights.dtype)
-        attn_weights = paddle.where(invalid, zeros, attn_weights)
-        denom = attn_weights.sum(axis=-1, keepdim=True).clip(min=1e-10)
-        attn_weights = attn_weights / denom
         attn_weights = paddle.where(invalid, zeros, attn_weights)
         ctx.save_for_backward(attn_weights, invalid)
         return attn_weights
@@ -242,6 +243,75 @@ def rotate_activation(
 # ---------------------------------------------------------------------------
 # Unfused DSA attention (explicit bmm, supports asymmetric Q/K vs V dims)
 # ---------------------------------------------------------------------------
+def _e519_dump_unfused(
+    *,
+    query,
+    key,
+    value,
+    combined_mask,
+    attn_scores,
+    attn_weights,
+    latent_out,
+    softmax_scale,
+    uac_mqa,
+) -> None:
+    dump = os.environ.get("MODEL_REPRO_CORE_OP_DUMP_DIR")
+    if not dump:
+        return
+    import json
+
+    import paddle.distributed as dist
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    # E-518: first equal-X Y-cut is decoder L0 rank0 at call 5 (M=168).
+    if rank != 0:
+        return
+    n = int(getattr(_e519_dump_unfused, "_n", 0))
+    _e519_dump_unfused._n = n + 1
+    call = n + 1
+    # Decoder L0 is the first unfused call on rank0 each step. Keep every
+    # call so pairing can select call 5; write compact bf16/fp32 bins.
+    os.makedirs(dump, exist_ok=True)
+    stem = f"paddle_r{rank}_c{call}_s{int(query.shape[1])}"
+    meta = {
+        "framework": "paddle",
+        "rank": int(rank),
+        "call": int(call),
+        "shape_q": list(query.shape),
+        "shape_k": list(key.shape),
+        "shape_v": list(value.shape) if value is not None else None,
+        "shape_mask": list(combined_mask.shape) if combined_mask is not None else None,
+        "shape_scores": list(attn_scores.shape),
+        "shape_probs": list(attn_weights.shape),
+        "shape_latent": list(latent_out.shape),
+        "softmax_scale": float(softmax_scale),
+        "uac_mqa": bool(uac_mqa),
+        "dtype_q": str(query.dtype),
+    }
+    query.detach().astype("float32").cpu().numpy().tofile(
+        os.path.join(dump, f"{stem}_q.f32.bin")
+    )
+    key.detach().astype("float32").cpu().numpy().tofile(
+        os.path.join(dump, f"{stem}_k.f32.bin")
+    )
+    if combined_mask is not None:
+        combined_mask.detach().astype("float32").cpu().numpy().tofile(
+            os.path.join(dump, f"{stem}_mask.f32.bin")
+        )
+    attn_scores.detach().astype("float32").cpu().numpy().tofile(
+        os.path.join(dump, f"{stem}_scores.f32.bin")
+    )
+    attn_weights.detach().astype("float32").cpu().numpy().tofile(
+        os.path.join(dump, f"{stem}_probs.f32.bin")
+    )
+    latent_out.detach().astype("float32").cpu().numpy().tofile(
+        os.path.join(dump, f"{stem}_latent.f32.bin")
+    )
+    with open(os.path.join(dump, f"{stem}_meta.json"), "w") as stream:
+        json.dump(meta, stream)
+        stream.write("\n")
+
+
 def _unfused_dsa_attention(
     query: Tensor,
     key: Tensor,
@@ -320,6 +390,8 @@ def _unfused_dsa_attention(
             .reshape([b * nhpp, s, s])
         )
         attn_scores = attn_scores + mask.cast("float32")
+    else:
+        mask = None
 
     if _ACCURACY_COMPATIBLE_KERNEL:
         attn_weights = _AccuracyCompatibleSoftmax.apply(attn_scores)
@@ -328,6 +400,17 @@ def _unfused_dsa_attention(
 
     # Attention_weights * V: [b*nhpp, s, v_hd]
     output = paddle.bmm(attn_weights.cast(v.dtype), v)
+    _e519_dump_unfused(
+        query=query,
+        key=key,
+        value=value,
+        combined_mask=combined_mask,
+        attn_scores=attn_scores,
+        attn_weights=attn_weights,
+        latent_out=output,
+        softmax_scale=softmax_scale,
+        uac_mqa=uac_mqa,
+    )
 
     # [b*nhpp, s, v_hd] -> [b, s, nhpp*v_hd]
     output = (
@@ -1938,7 +2021,25 @@ class DSAttention(FleetLayer):
                 q_abs_nope = q_abs_nope.transpose([1, 0, 2]).reshape(
                     [query.shape[0], query.shape[1], query.shape[2], k_abs_weight.shape[-1]]
                 )
+                from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+
+                _e497_qa_record(
+                    "qabs",
+                    q_nope,
+                    q_abs_nope,
+                    k_abs_weight,
+                    getattr(self, "layer_number", -1),
+                    getattr(self, "is_mtp_layer", False),
+                )
                 q_absorbed = paddle.concat([q_abs_nope, q_pe], axis=-1)  # [b,s,h,576]
+                _e497_qa_record(
+                    "qabscat",
+                    q_absorbed,
+                    q_absorbed,
+                    None,
+                    getattr(self, "layer_number", -1),
+                    getattr(self, "is_mtp_layer", False),
+                )
             # Build the absorbed key in the core's layout [s?b] matching the query.
             # At TP>1+SP the kv latent is seq-sharded while the query/key are
             # full-seq; gather the kv latent to the full seq first.
@@ -2018,6 +2119,24 @@ class DSAttention(FleetLayer):
                     "bshc,hdc->bshd", latent_out, v_b_proj_weight
                 )  # [b, s, h, v_head_dim] (mirrors mcore einsum("sbhc,hdc->sbhd"))
             core_attn_out = core_attn_out.reshape([b, sq, nh * core_attn_out.shape[-1]])
+            from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+
+            _e497_qa_record(
+                "core",
+                q_absorbed,
+                core_attn_out,
+                None,
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
+            _e497_qa_record(
+                "vup",
+                latent_out,
+                core_attn_out,
+                v_b_proj_weight,
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
         else:
             core_attn_out = _unfused_dsa_attention(
                 query, key, value, combined_mask, self.softmax_scale

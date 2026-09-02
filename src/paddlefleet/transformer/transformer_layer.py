@@ -43,6 +43,82 @@ from paddlefleet.recompute_utils import (
     need_recompute_in_block,
     need_recompute_in_first_n,
 )
+
+# [E497-LN-XY-HASH] hash-only X/Y/dY/W for input_layernorm. Hook returns g.
+_E497_LN_CALLS: dict[str, int] = {}
+
+
+def _e497_ln_sha(t, *, t01: bool = False) -> str:
+    x = t.detach()
+    if t01 and x.ndim == 3:
+        x = x.transpose([1, 0, 2])
+    x = x.contiguous()
+    if "bfloat16" in str(x.dtype):
+        buf = x.view(dtype="uint16").cpu().numpy().tobytes()
+    else:
+        buf = x.cpu().numpy().tobytes()
+    return hashlib.sha256(buf).hexdigest()
+
+
+def _e497_ln_record(x, y, w, layer, mtp) -> None:
+    dump = os.environ.get("MODEL_REPRO_QA_XY_HASH_DIR")
+    if not dump or y is None:
+        return
+    import json
+
+    import paddle.distributed as dist
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    key = f"ln|{layer}|{int(bool(mtp))}|{rank}"
+    _E497_LN_CALLS[key] = _E497_LN_CALLS.get(key, 0) + 1
+    call = _E497_LN_CALLS[key]
+    os.makedirs(dump, exist_ok=True)
+    if not getattr(_e497_ln_record, "_announced", False):
+        print(f"[E497-LN-XY-HASH] dir={dump} rank={rank}", flush=True)
+        _e497_ln_record._announced = True
+    rec = {
+        "kind": "fwd",
+        "tag": "ln",
+        "layer": int(layer) if layer is not None else -1,
+        "mtp": int(bool(mtp)),
+        "rank": int(rank),
+        "call": int(call),
+        "shape_x": list(x.shape),
+        "dtype_x": str(x.dtype),
+        "sha_x": _e497_ln_sha(x),
+        "sha_x_t01": _e497_ln_sha(x, t01=True) if x.ndim == 3 else None,
+        "shape_y": list(y.shape),
+        "dtype_y": str(y.dtype),
+        "sha_y": _e497_ln_sha(y),
+        "sha_y_t01": _e497_ln_sha(y, t01=True) if y.ndim == 3 else None,
+        "shape_w": list(w.shape) if w is not None else None,
+        "dtype_w": str(w.dtype) if w is not None else None,
+        "sha_w": _e497_ln_sha(w) if w is not None else None,
+    }
+    with open(os.path.join(dump, f"rank{rank}.jsonl"), "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    def _on_dy(g, *, _dump=dump, _rank=rank, _base=rec):
+        if g is None:
+            return g
+        bwd = {
+            "kind": "bwd",
+            "tag": "ln",
+            "layer": _base["layer"],
+            "mtp": _base["mtp"],
+            "rank": _rank,
+            "call": _base["call"],
+            "shape_dy": list(g.shape),
+            "dtype_dy": str(g.dtype),
+            "sha_dy": _e497_ln_sha(g),
+            "sha_dy_t01": _e497_ln_sha(g, t01=True) if g.ndim == 3 else None,
+        }
+        with open(os.path.join(_dump, f"rank{_rank}.jsonl"), "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(bwd, ensure_ascii=False) + "\n")
+        return g
+
+    if getattr(y, "stop_gradient", True) is False:
+        y.register_hook(_on_dy)
 from paddlefleet.tensor_parallel import RecomputeWithoutOutput
 from paddlefleet.transformer.dsv4_hybrid_attention import DSv4HybridAttention
 from paddlefleet.transformer.identity_op import IdentityFuncOp, IdentityOp
@@ -1264,6 +1340,13 @@ class TransformerLayer(nn.Layer):
             )
         else:
             input_layernorm_output = self.input_layernorm(hidden_states)
+        _e497_ln_record(
+            hidden_states,
+            input_layernorm_output,
+            getattr(self.input_layernorm, "weight", None),
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
 
         self._log_md5(
             input_layernorm_output, "input_layernorm_out", self.layer_number
@@ -1353,6 +1436,29 @@ class TransformerLayer(nn.Layer):
                     residual,
                     self.hidden_dropout_prob,
                 )
+                from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+
+                _attn_y = (
+                    attention_output_with_bias[0]
+                    if isinstance(attention_output_with_bias, tuple)
+                    else attention_output_with_bias
+                )
+                _e497_qa_record(
+                    "bda",
+                    _attn_y,
+                    hidden_states,
+                    None,
+                    getattr(self, "layer_number", -1),
+                    getattr(self, "is_mtp_layer", False),
+                )
+                _e497_qa_record(
+                    "res",
+                    residual,
+                    hidden_states,
+                    None,
+                    getattr(self, "layer_number", -1),
+                    getattr(self, "is_mtp_layer", False),
+                )
 
         # Residual connection.
         residual = hidden_states
@@ -1418,6 +1524,16 @@ class TransformerLayer(nn.Layer):
             post_attention_layernorm_output = self.post_attention_layernorm(
                 hidden_states
             )
+            from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+
+            _e497_qa_record(
+                "postn",
+                hidden_states,
+                post_attention_layernorm_output,
+                getattr(self.post_attention_layernorm, "weight", None),
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
 
         self._log_md5(
             post_attention_layernorm_output,
@@ -1470,6 +1586,21 @@ class TransformerLayer(nn.Layer):
                 )
             else:
                 mlp_output_with_bias = self.mlp(post_attention_layernorm_output)
+            from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+
+            _mlp_y = (
+                mlp_output_with_bias[0]
+                if isinstance(mlp_output_with_bias, tuple)
+                else mlp_output_with_bias
+            )
+            _e497_qa_record(
+                "mlp",
+                post_attention_layernorm_output,
+                _mlp_y,
+                None,
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
 
         # Log MLP raw output before BDA
         if (
@@ -1499,6 +1630,21 @@ class TransformerLayer(nn.Layer):
                     mlp_output_with_bias,
                     residual,
                     self.hidden_dropout_prob,
+                )
+                from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+
+                _mlp_y = (
+                    mlp_output_with_bias[0]
+                    if isinstance(mlp_output_with_bias, tuple)
+                    else mlp_output_with_bias
+                )
+                _e497_qa_record(
+                    "mlpbda",
+                    _mlp_y,
+                    hidden_states,
+                    None,
+                    getattr(self, "layer_number", -1),
+                    getattr(self, "is_mtp_layer", False),
                 )
 
         if is_first_fwd:

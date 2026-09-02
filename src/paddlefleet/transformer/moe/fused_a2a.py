@@ -494,24 +494,17 @@ def fused_dispatch_forward_func(
         allocate_on_comm_stream=allocate_on_comm_stream,
         **dispatch_kwargs,
     )
-    # E-758: UAC+fusion Buffer.dispatch after-event current_stream_wait
-    # like torch FusedDispatch. Torch fused_a2a.FusedDispatch.forward
-    # waits on after_event_overlap after buffer.dispatch when
-    # async_finish. Paddle live dispatch keeps async_finish=False
-    # (E-734 LossNan) and allocate_on_comm_stream=False (E-752 assert)
-    # so the after-event is otherwise unused. E-754 only fed the
-    # layout previous_event into dispatch. E-695 waits combine only.
-    # Do not wrap fused_combine_forward_func. Needle has no comma
-    # (E-690 fail-closed).
-    if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
-        if event is not None and getattr(event, "current_stream_wait", None):
-            event.current_stream_wait()
-            if not getattr(fused_dispatch_forward_func, "_e758_logged", False):
-                fused_dispatch_forward_func._e758_logged = True
-                print(
-                    "E-758: UAC+fusion Buffer.dispatch after-event current_stream_wait like torch FusedDispatch",
-                    flush=True,
-                )
+    # E-758 disconnected: UAC Buffer.dispatch after-event
+    # current_stream_wait with live async_finish=False hit
+    # EventOverlap.current_stream_wait assert event is not None
+    # (exit 241) on unique-ckpt dump-off P2E2 N=5. Torch
+    # FusedDispatch only waits after_event when async_finish.
+    # E-734 already closed async_finish=True (LossNan). E-752
+    # already closed allocate_on_comm_stream=True (DeepEP
+    # previous_event.has_value() and async). E-695 waits
+    # combine after-event only after setting async_finish.
+    # Torch Flex token_dispatch(async+alloc) cannot be
+    # mirrored. Needle left in comments only.
 
     states = {}
     states["dispatched_indices"] = recv_token_indices

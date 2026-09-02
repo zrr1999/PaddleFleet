@@ -702,6 +702,32 @@ class _DeepEPManager(_DispatchManager):
         self.tokens_per_expert = states["tokens_per_expert"]
         self.dispatched_indices = states["dispatched_indices"]
         self.dispatched_probs = dispatched_probs
+        # E-755: UAC+fusion decoder DeepEP dispatched indices/probs sorted
+        # by expert id AFTER fused_dispatch (not at fused_dispatch entry).
+        # E-673 decoder dispatched_hs exact; indices/probs per-row set/sort
+        # equal but column permutation differs. E-747-E-750 mutated routing
+        # at fused_dispatch entry and fail-closed. This injector reorders
+        # DeepEP outputs that feed FusionMoe unzip. Uses paddle.gather not
+        # take_along_axis (E-747). Needle has no comma (E-690 fail-closed).
+        if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+            _idx = self.dispatched_indices
+            _prob = self.dispatched_probs
+            if _idx is not None and _prob is not None and _idx.ndim == 2:
+                _order = paddle.argsort(_idx, axis=-1)
+                _rows = paddle.arange(_idx.shape[0], dtype=_order.dtype).unsqueeze(-1)
+                _flat = (_rows * _idx.shape[1] + _order).reshape([-1])
+                self.dispatched_indices = paddle.gather(
+                    _idx.reshape([-1]), _flat
+                ).reshape(_idx.shape)
+                self.dispatched_probs = paddle.gather(
+                    _prob.reshape([-1]), _flat
+                ).reshape(_prob.shape)
+                if not getattr(self, "_e755_dispatch_out_sort_logged", False):
+                    self._e755_dispatch_out_sort_logged = True
+                    print(
+                        "E-755: UAC+fusion decoder DeepEP dispatched indices/probs sorted by expert id after fused_dispatch",
+                        flush=True,
+                    )
         # E-735: UAC+fusion zip token values clone at DeepEPManager.dispatch
         # return. Not fused_combine_forward_func. Not E-734 dispatch
         # async_finish. Not E-715-E-733 zip wraps. Needle has no comma.

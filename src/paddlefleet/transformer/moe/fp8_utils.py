@@ -15,6 +15,8 @@
 # limitations under the License.
 """FP8 Utils"""
 
+import os
+
 import numpy
 import paddle
 import paddle.nn.functional as F
@@ -117,6 +119,9 @@ __all__ = [
 FP8_ALIGN = 128
 
 
+_E687_TPE_ALIGN_NEEDLE = False
+
+
 def moe_token_padding_alignment(
     *, use_fp8_mlp: bool, moe_grouped_gemm: bool, use_accuracy_compatible: bool
 ) -> int:
@@ -126,7 +131,17 @@ def moe_token_padding_alignment(
     #   token count and cuBLAS picks the same algorithm as MG SequentialMLP. In all
     #   other cases (including when accuracy compatible is off) align to FP8_ALIGN
     #   to preserve the original behavior.
-    if use_accuracy_compatible and not use_fp8_mlp and not moe_grouped_gemm:
+    # E-687: UAC+fusion permute/GEMM uses unzip tokens_per_expert (alignment=1)
+    # so grouped_gemm M dim equals E-678 / SequentialMLP counts, not 128-pad.
+    if use_accuracy_compatible and not use_fp8_mlp:
+        if moe_grouped_gemm:
+            global _E687_TPE_ALIGN_NEEDLE
+            if not _E687_TPE_ALIGN_NEEDLE:
+                _E687_TPE_ALIGN_NEEDLE = True
+                print(
+                    "E-687: UAC+fusion permute/GEMM uses unzip tokens_per_expert (alignment=1)",
+                    flush=True,
+                )
         return 1
     return FP8_ALIGN
 
@@ -875,6 +890,7 @@ class ExpertsGroupGemmContiguousNode:
                 self.experts = [custom_map.experts[expert_id]]
         else:
             self.grouped_gemm_experts = custom_map.grouped_gemm_experts
+        self.layer_number = getattr(custom_map, "layer_number", -1)
         self.expert_id = expert_id
         self.recompute_moe_gate_up = recompute_moe_gate_up
         self.dequant_input = dequant_input
@@ -1011,6 +1027,52 @@ class ExpertsGroupGemmContiguousNode:
                         o1,
                         self.m_indices,
                     )
+                elif (
+                    self.use_accuracy_compatible
+                    and not self.use_fp8_mlp
+                ):
+                    # E-690: UAC+fusion fc1 uses per-expert F.linear not batched_gemm.
+                    # E-689 isolate: FLAG=1 F.linear IEEE-equals torch SequentialMLP
+                    # fc1 Y 16/16; batched_gemm 8/16 ULP on equal unzipped_hs.
+                    # E-713: UAC+fusion zip token values use TN matmul for
+                    # routed fc1 not F.linear. E-712 TN was routed fc2 only.
+                    # Needle has no comma (E-690 fail-closed).
+                    expert_output_list = []
+                    start_idx = 0
+                    for i, token_num in enumerate(self.tokens_per_expert):
+                        token_num = int(token_num)
+                        if token_num == 0:
+                            continue
+                        end_idx = start_idx + token_num
+                        x_i = x[start_idx:end_idx].contiguous()
+                        expert_w1_i = expert_w1[i]
+                        expert_output_list.append(
+                            paddle.matmul(
+                                x_i,
+                                expert_w1_i.t().contiguous(),
+                                transpose_y=True,
+                            )
+                        )
+                        start_idx = end_idx
+                    if expert_output_list:
+                        o1 = paddle.concat(expert_output_list, axis=0)
+                    else:
+                        o1 = paddle.empty(
+                            [x.shape[0], expert_w1.shape[2]],
+                            dtype=expert_w1[0].dtype,
+                        )
+                    if not getattr(self, "_e690_fc1_linear_logged", False):
+                        self._e690_fc1_linear_logged = True
+                        print(
+                            "E-690: UAC+fusion fc1 uses per-expert F.linear not batched_gemm",
+                            flush=True,
+                        )
+                    if not getattr(self, "_e713_fc1_tn_logged", False):
+                        self._e713_fc1_tn_logged = True
+                        print(
+                            "E-713: UAC+fusion zip token values use TN matmul for routed fc1 not F.linear",
+                            flush=True,
+                        )
                 else:
                     o1 = paddle.incubate.nn.functional.batched_gemm(
                         x,
@@ -1392,6 +1454,75 @@ class ExpertsGroupGemmContiguousNode:
                 gate, up = paddle.chunk(o1, 2, dim=-1)
                 o2 = F.gelu(gate, approximate=True) * up
                 o2 = (o2 * unzipped_probs.unsqueeze(-1)).cast(o1.dtype)
+            elif self.use_accuracy_compatible:
+                # E-682: moe_expert_fusion=true used fused_swiglu_scale, which is
+                # ULP vs torch SequentialMLP (bf16 silu*up then *fp32 scale).
+                # Keep fused kernel when UAC is off.
+                # E-710 disconnected: post-fc2 unzipped_probs moved paddle
+                # step-1 12.28316879 -> 12.282972; first_bad still 1.
+                # Torch SequentialMLP scales after silu*up before fc2.
+                # E-711: UAC+fusion zip token values round silu-up then
+                # fp32 scale like torch SequentialMLP (two casts) not
+                # one fused (silu*up*probs).cast. Needle has no comma.
+                x_glu, x_linear = paddle.chunk(o1, chunks=2, axis=-1)
+                probs = unzipped_probs
+                if len(probs.shape) == 1:
+                    probs = probs.unsqueeze(-1)
+                # E-716 disconnected: fp32 F.silu moved paddle step-1
+                # 12.28316879 -> 12.282679 bits 0x414485db; first_bad still 1.
+                # Torch SequentialMLP default is bf16 F.silu(x_glu)*x_linear
+                # then fp32 scale. Restore E-711 two-round around bf16 silu.
+                glu = (F.silu(x_glu) * x_linear).cast(o1.dtype)
+                o2 = (glu.cast("float32") * probs.cast("float32")).cast(
+                    o1.dtype
+                )
+                if not getattr(self, "_e711_two_round_logged", False):
+                    self._e711_two_round_logged = True
+                    print(
+                        "E-711: UAC+fusion zip token values round silu-up then fp32 scale like torch SequentialMLP",
+                        flush=True,
+                    )
+                _o2_dump = os.environ.get("MODEL_REPRO_O2_DUMP_DIR")
+                if _o2_dump:
+                    import hashlib as _ho2
+                    import paddle.distributed as _pdo2
+
+                    _rank = _pdo2.get_rank() if _pdo2.is_initialized() else 0
+                    _layer = getattr(
+                        getattr(self, "grouped_gemm_experts", None),
+                        "layer_number",
+                        None,
+                    )
+                    if _layer is None:
+                        _layer = getattr(self, "layer_number", getattr(self, "expert_id", -1))
+                    if not hasattr(self, "_e684_o2_dumped"):
+                        self._e684_o2_dumped = set()
+                    _key = ("o2", int(_layer) if _layer is not None else -1, int(_rank))
+                    if _key not in self._e684_o2_dumped:
+                        self._e684_o2_dumped.add(_key)
+                        os.makedirs(_o2_dump, exist_ok=True)
+                        _arr = o2.detach().astype("float32").cpu().numpy()
+                        _path = os.path.join(
+                            _o2_dump, f"paddle_o2_l{_layer}_r{_rank}.f32.bin"
+                        )
+                        _arr.tofile(_path)
+                        print(
+                            f"[O2-DUMP] {_path} shape={tuple(_arr.shape)} "
+                            f"dtype={_arr.dtype} sha16={_ho2.sha256(_arr.tobytes()).hexdigest()[:16]}",
+                            flush=True,
+                        )
+                        _tpe = getattr(self, "tokens_per_expert", None)
+                        if _tpe is not None:
+                            _tarr = paddle.to_tensor(_tpe, dtype="int32").cpu().numpy().astype("int32")
+                            _tpath = os.path.join(
+                                _o2_dump, f"paddle_tokens_per_expert_l{_layer}_r{_rank}.i32.bin"
+                            )
+                            _tarr.tofile(_tpath)
+                            print(
+                                f"[O2-DUMP] {_tpath} shape={tuple(_tarr.shape)} "
+                                f"dtype={_tarr.dtype}",
+                                flush=True,
+                            )
             elif self.clamp_value is not None and self.clamp_value > 0:
                 o2 = fused_swiglu_scale_forward(
                     o1, unzipped_probs, self.clamp_value
@@ -1415,6 +1546,53 @@ class ExpertsGroupGemmContiguousNode:
                         o3,
                         self.m_indices,
                     )
+                elif (
+                    self.use_accuracy_compatible
+                    and not self.use_fp8_mlp
+                ):
+                    # E-692: UAC+fusion fc2 uses per-expert F.linear not batched_gemm.
+                    # Keep E-691 fc1 F.linear. Needle has no comma (E-690 fail-closed).
+                    # E-712: UAC+fusion zip token values use TN matmul for
+                    # routed fc2 not F.linear. E-704 TN was shared-expert
+                    # fc1 only. Needle has no comma (E-690 fail-closed).
+                    expert_output_list = []
+                    start_idx = 0
+                    for i, token_num in enumerate(self.tokens_per_expert):
+                        token_num = int(token_num)
+                        if token_num == 0:
+                            continue
+                        end_idx = start_idx + token_num
+                        o2_i = o2[start_idx:end_idx].contiguous()
+                        expert_w2_i = expert_w2[i]
+                        expert_output_list.append(
+                            paddle.matmul(
+                                o2_i,
+                                expert_w2_i.t().contiguous(),
+                                transpose_y=True,
+                            )
+                        )
+                        start_idx = end_idx
+                    if expert_output_list:
+                        o3 = paddle.concat(expert_output_list, axis=0)
+                    else:
+                        o3 = paddle.empty(
+                            [o2.shape[0], expert_w2.shape[2]],
+                            dtype=o1.dtype,
+                        )
+                    if not getattr(self, "_e692_fc2_linear_logged", False):
+                        self._e692_fc2_linear_logged = True
+                        print(
+                            "E-692: UAC+fusion fc2 uses per-expert F.linear not batched_gemm",
+                            flush=True,
+                        )
+                    if not getattr(self, "_e712_fc2_tn_logged", False):
+                        self._e712_fc2_tn_logged = True
+                        print(
+                            "E-712: UAC+fusion zip token values use TN matmul for routed fc2 not F.linear",
+                            flush=True,
+                        )
+                    # E-710 disconnected: post-fc2 scale is not torch
+                    # SequentialMLP (scale stays after silu*up, before fc2).
                 else:
                     o3 = paddle.incubate.nn.functional.batched_gemm(
                         o2,
@@ -2235,10 +2413,203 @@ class ExpertsGroupGemmContiguousNode:
 
         num_expert = len(expert_w1)
 
+        # E-680: live last-decoder expert W bits. Needle: [LIVE-EXPERT-W-DUMP]
+        _w_dump = os.environ.get("MODEL_REPRO_LIVE_EXPERT_W_DUMP_DIR")
+        if _w_dump:
+            import hashlib as _hw
+            import paddle.distributed as _pdw
+
+            _rank = _pdw.get_rank() if _pdw.is_initialized() else 0
+            _layer = getattr(self, "layer_number", None)
+            if _layer is None:
+                _parent = getattr(self, "grouped_gemm_experts", None)
+                _layer = getattr(_parent, "layer_number", None) if _parent is not None else None
+            if _layer is None:
+                _layer = -1
+            if int(_rank) in (2, 3) and (int(_layer) in (-1, 3)):
+                if not hasattr(self, "_e680_w_dumped"):
+                    self._e680_w_dumped = set()
+                os.makedirs(_w_dump, exist_ok=True)
+                _w1 = expert_w1
+                _w2 = expert_w2
+                if hasattr(_w1, "dtype"):
+                    _w1_list = [_w1[i] for i in range(int(_w1.shape[0]))]
+                    _w2_list = [_w2[i] for i in range(int(_w2.shape[0]))]
+                else:
+                    _w1_list = list(_w1)
+                    _w2_list = list(_w2)
+                for _ei, _tw in enumerate(_w1_list):
+                    _key = ("w1", int(_layer), int(_ei), int(_rank))
+                    if _key in self._e680_w_dumped:
+                        continue
+                    self._e680_w_dumped.add(_key)
+                    _arr = _tw.detach().view("uint16").cpu().numpy()
+                    _path = os.path.join(
+                        _w_dump, f"paddle_w1_e{_ei}_l{_layer}_r{_rank}.u16.bin"
+                    )
+                    _arr.tofile(_path)
+                    print(
+                        f"[LIVE-EXPERT-W-DUMP] {_path} shape={tuple(_arr.shape)} "
+                        f"dtype={_arr.dtype} sha16={_hw.sha256(_arr.tobytes()).hexdigest()[:16]}",
+                        flush=True,
+                    )
+                for _ei, _tw in enumerate(_w2_list):
+                    _key = ("w2", int(_layer), int(_ei), int(_rank))
+                    if _key in self._e680_w_dumped:
+                        continue
+                    self._e680_w_dumped.add(_key)
+                    _arr = _tw.detach().view("uint16").cpu().numpy()
+                    _path = os.path.join(
+                        _w_dump, f"paddle_w2_e{_ei}_l{_layer}_r{_rank}.u16.bin"
+                    )
+                    _arr.tofile(_path)
+                    print(
+                        f"[LIVE-EXPERT-W-DUMP] {_path} shape={tuple(_arr.shape)} "
+                        f"dtype={_arr.dtype} sha16={_hw.sha256(_arr.tobytes()).hexdigest()[:16]}",
+                        flush=True,
+                    )
+
         # o1
         o1 = self.fwd_gate_up(
             hs_out, expert_w1, num_expert, tokens_per_expert, scale=scale
         )
+        # E-678: last-decoder grouped GEMM internals. Needle: [FUSION-GEMM-DUMP]
+        _gemm_dump = os.environ.get("MODEL_REPRO_FUSION_GEMM_DUMP_DIR")
+        if _gemm_dump:
+            import hashlib as _h
+            import paddle.distributed as _pd
+
+            _rank = _pd.get_rank() if _pd.is_initialized() else 0
+            _layer = getattr(getattr(self, "grouped_gemm_experts", None), "layer_number", None)
+            if _layer is None:
+                _layer = getattr(self, "expert_id", -1)
+            _key = ("group_gemm_o1", int(_layer) if _layer is not None else -1, int(_rank))
+            if not hasattr(self, "_e678_dumped"):
+                self._e678_dumped = set()
+            if _key not in self._e678_dumped:
+                self._e678_dumped.add(_key)
+                os.makedirs(_gemm_dump, exist_ok=True)
+                _arr = o1.detach().astype("float32").cpu().numpy()
+                _path = os.path.join(_gemm_dump, f"paddle_group_gemm_o1_l{_layer}_r{_rank}.f32.bin")
+                _arr.tofile(_path)
+                print(
+                    f"[FUSION-GEMM-DUMP] {_path} shape={tuple(_arr.shape)} "
+                    f"dtype={_arr.dtype} sha16={_h.sha256(_arr.tobytes()).hexdigest()[:16]}",
+                    flush=True,
+                )
+        # E-686: FusionMoe self.tokens_per_expert + pad-block valid o1, BEFORE
+        # fwd_down may clear o1. Needle: [FUSIONMOE-O1-DUMP]. Not E-685 wrap.
+        _fm_dump = os.environ.get("MODEL_REPRO_FUSIONMOE_O1_DUMP_DIR")
+        if _fm_dump:
+            import hashlib as _hfm
+            import paddle.distributed as _pdfm
+
+            _rank = _pdfm.get_rank() if _pdfm.is_initialized() else 0
+            _layer = getattr(getattr(self, "grouped_gemm_experts", None), "layer_number", None)
+            if _layer is None:
+                _layer = getattr(self, "layer_number", getattr(self, "expert_id", -1))
+            if int(_rank) in (2, 3) and int(_layer) in (-1, 3):
+                if not hasattr(self, "_e686_o1_dumped"):
+                    self._e686_o1_dumped = set()
+                os.makedirs(_fm_dump, exist_ok=True)
+                def _as_int_list(v):
+                    if v is None:
+                        return None
+                    if hasattr(v, "numpy"):
+                        return [int(x) for x in v.numpy().reshape(-1).tolist()]
+                    return [int(x) for x in list(v)]
+                _tpe_list = _as_int_list(getattr(self, "_e686_real_tpe", None))
+                _pad_list = _as_int_list(getattr(self, "_e686_pad_tpe", None))
+                if _tpe_list is not None and _pad_list is not None:
+                    _off = 0
+                    for _ei, (_n, _pd) in enumerate(zip(_tpe_list, _pad_list)):
+                        _key = ("fmo1", int(_layer) if _layer is not None else -1, int(_ei), int(_rank))
+                        if _key in self._e686_o1_dumped:
+                            _off += int(_pd)
+                            continue
+                        self._e686_o1_dumped.add(_key)
+                        _n = int(_n)
+                        _pd = int(_pd)
+                        _sl = o1[_off : _off + _n] if _n > 0 else o1[0:0]
+                        _arr = _sl.detach().astype("float32").cpu().numpy()
+                        _path = os.path.join(
+                            _fm_dump, f"paddle_fmo1_e{_ei}_l{_layer}_r{_rank}.f32.bin"
+                        )
+                        _arr.tofile(_path)
+                        print(
+                            f"[FUSIONMOE-O1-DUMP] {_path} n={_n} pad={_pd} "
+                            f"shape={tuple(_arr.shape)} dtype={_arr.dtype} "
+                            f"sha16={_hfm.sha256(_arr.tobytes()).hexdigest()[:16]}",
+                            flush=True,
+                        )
+                        _off += _pd
+                    _tarr = paddle.to_tensor(_tpe_list, dtype="int32").cpu().numpy().astype("int32")
+                    _parr = paddle.to_tensor(_pad_list, dtype="int32").cpu().numpy().astype("int32")
+                    _tpath = os.path.join(
+                        _fm_dump, f"paddle_fm_tokens_per_expert_l{_layer}_r{_rank}.i32.bin"
+                    )
+                    _ppath = os.path.join(
+                        _fm_dump, f"paddle_fm_padded_tokens_per_expert_l{_layer}_r{_rank}.i32.bin"
+                    )
+                    _tarr.tofile(_tpath)
+                    _parr.tofile(_ppath)
+                    print(
+                        f"[FUSIONMOE-O1-DUMP] {_tpath} tpe={_tpe_list} pad={_pad_list}",
+                        flush=True,
+                    )
+        # E-685: per-expert valid o1 (real tokens_per_expert, not 128-pad concat).
+        # Needle: [O1-VALID-DUMP]. Distinct from E-684 o2 concat dump.
+        _o1_dump = os.environ.get("MODEL_REPRO_O1_VALID_DUMP_DIR")
+        if _o1_dump:
+            import hashlib as _ho1
+            import paddle.distributed as _pdo1
+
+            _rank = _pdo1.get_rank() if _pdo1.is_initialized() else 0
+            _layer = getattr(getattr(self, "grouped_gemm_experts", None), "layer_number", None)
+            if _layer is None:
+                _layer = getattr(self, "layer_number", getattr(self, "expert_id", -1))
+            if int(_rank) in (2, 3) and int(_layer) in (-1, 3):
+                if not hasattr(self, "_e685_o1_dumped"):
+                    self._e685_o1_dumped = set()
+                os.makedirs(_o1_dump, exist_ok=True)
+                def _as_int_list(v):
+                    if v is None:
+                        return None
+                    if hasattr(v, "numpy"):
+                        return [int(x) for x in v.numpy().reshape(-1).tolist()]
+                    return [int(x) for x in list(v)]
+                _tpe_list = _as_int_list(getattr(self, "_e685_real_tpe", None)) or _as_int_list(tokens_per_expert)
+                _pad_list = _as_int_list(getattr(self, "_e685_pad_tpe", None)) or _tpe_list
+                _off = 0
+                for _ei, (_n, _pd) in enumerate(zip(_tpe_list, _pad_list)):
+                    _key = ("o1v", int(_layer) if _layer is not None else -1, int(_ei), int(_rank))
+                    if _key in self._e685_o1_dumped:
+                        _off += int(_pd)
+                        continue
+                    self._e685_o1_dumped.add(_key)
+                    _n = int(_n)
+                    _pd = int(_pd)
+                    _sl = o1[_off : _off + _n] if _n > 0 else o1[0:0]
+                    _arr = _sl.detach().astype("float32").cpu().numpy()
+                    _path = os.path.join(
+                        _o1_dump, f"paddle_o1_e{_ei}_l{_layer}_r{_rank}.f32.bin"
+                    )
+                    _arr.tofile(_path)
+                    print(
+                        f"[O1-VALID-DUMP] {_path} n={_n} pad={_pd} shape={tuple(_arr.shape)} "
+                        f"dtype={_arr.dtype} sha16={_ho1.sha256(_arr.tobytes()).hexdigest()[:16]}",
+                        flush=True,
+                    )
+                    _off += _pd
+                _tarr = paddle.to_tensor(_tpe_list, dtype="int32").cpu().numpy().astype("int32")
+                _tpath = os.path.join(
+                    _o1_dump, f"paddle_tokens_per_expert_l{_layer}_r{_rank}.i32.bin"
+                )
+                _tarr.tofile(_tpath)
+                print(
+                    f"[O1-VALID-DUMP] {_tpath} tpe={_tpe_list} pad={_pad_list}",
+                    flush=True,
+                )
         if not self.recompute_moe_gate_up:
             self.o1 = o1
             clear_o1 = False
@@ -2524,6 +2895,8 @@ class ExpertsGroupGemmContiguousNode:
         else:
             o1 = self.o1
 
+        # E-710 disconnected: post-fc2 unzipped_probs is not torch
+        # SequentialMLP. Restore pre-fc2 scale into bwd_down_input_bf16.
         do1, o2_s, probs_grad = self.bwd_down_input_bf16(
             expert_w2, out_grad, o1, unzipped_probs
         )

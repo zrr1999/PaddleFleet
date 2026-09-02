@@ -199,12 +199,34 @@ class MLP(FleetLayer):
             return {}
         return {"up_gate_proj.weight": (ortho_gate_up, {})}
 
+    def _e593_dense_record(self, tag, x, y, w):
+        # Dump-off first-stage L0 Linear+SwiGLU bins. Observation only.
+        dump = os.environ.get("MODEL_REPRO_FSRES_BIN_DIR")
+        if not dump or y is None:
+            return
+        from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+
+        _e497_qa_record(
+            tag,
+            x,
+            y,
+            w,
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
+
     def forward(self, hidden_states, per_token_scale=None):
         """Perform the forward pass through the MLP block."""
         # [s, b, 4 * h/p]
         nvtx_range_push(suffix="up_gate_proj")
         intermediate_parallel, bias_parallel = self.up_gate_proj(hidden_states)
         nvtx_range_pop(suffix="up_gate_proj")
+        self._e593_dense_record(
+            "mlpfc1",
+            hidden_states,
+            intermediate_parallel,
+            getattr(self.up_gate_proj, "weight", None),
+        )
 
         nvtx_range_push(suffix="activation")
 
@@ -363,11 +385,20 @@ class MLP(FleetLayer):
                 )
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
         nvtx_range_pop(suffix="activation")
+        self._e593_dense_record(
+            "mlpglu", intermediate_parallel, intermediate_parallel, None
+        )
 
         # [s, b, h]
         nvtx_range_push(suffix="down_proj")
         output, output_bias = self.down_proj(intermediate_parallel)
         nvtx_range_pop(suffix="down_proj")
+        self._e593_dense_record(
+            "mlpfc2",
+            intermediate_parallel,
+            output,
+            getattr(self.down_proj, "weight", None),
+        )
 
         if per_token_scale is not None and output_bias is not None:
             # if this MLP is an expert, and bias is required, we add the bias to output directly

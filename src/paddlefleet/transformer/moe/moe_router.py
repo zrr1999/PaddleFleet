@@ -180,8 +180,76 @@ class FusedGateDetachMatmul(paddle.autograd.PyLayer):
         ctx.sequence_shards = int(sequence_shards) if sequence_shards else 1
         ctx.dtype = paddle.float32
         ctx.save_for_backward(x, w)
-        w = w.T
-        return F.linear(x.cast(ctx.dtype), w.cast(ctx.dtype))
+        _dump = os.environ.get("MODEL_REPRO_GATE_GEMM_DUMP_DIR")
+        # E-510 gated on M=42 and missed live GatherOp M=84. Dump every call.
+        if _dump:
+            import hashlib as _hh
+            import json as _json
+
+            import paddle.distributed as _pd
+
+            _rk = _pd.get_rank() if _pd.is_initialized() else 0
+            os.makedirs(_dump, exist_ok=True)
+            _x = x.detach()
+            _w = w.detach()
+            _wsha = _hh.sha256(
+                _w.astype("float32").cpu().numpy().tobytes()
+            ).hexdigest()[:8]
+            _cid = int(getattr(FusedGateDetachMatmul, "_e511_call", 0))
+            FusedGateDetachMatmul._e511_call = _cid + 1
+            _stem = f"paddle_r{_rk}_c{_cid}_s{int(_x.shape[0])}_{_wsha}"
+            _meta = {
+                "framework": "paddle",
+                "rank": int(_rk),
+                "call": _cid,
+                "wsha8": _wsha,
+                "shape_x": list(_x.shape),
+                "dtype_x": str(_x.dtype),
+                "shape_w": list(_w.shape),
+                "dtype_w": str(_w.dtype),
+                "x_contiguous": bool(_x.is_contiguous()),
+                "w_contiguous": bool(_w.is_contiguous()),
+                "wT_contiguous": bool(_w.T.is_contiguous()),
+                "sequence_shards": int(ctx.sequence_shards),
+                "use_accuracy_compatible": bool(use_accuracy_compatible),
+            }
+            _x.astype("float32").cpu().numpy().tofile(
+                os.path.join(_dump, f"{_stem}_x.f32.bin")
+            )
+            _w.astype("float32").cpu().numpy().tofile(
+                os.path.join(_dump, f"{_stem}_w.f32.bin")
+            )
+            with open(os.path.join(_dump, f"{_stem}_meta.json"), "w") as _f:
+                _json.dump(_meta, _f)
+                _f.write("\n")
+            ctx._e511_stem = _stem
+            ctx._e511_dump = _dump
+        x_f = x.cast(ctx.dtype)
+        w_t = w.cast(ctx.dtype).T
+        shards = int(ctx.sequence_shards)
+        if (
+            use_accuracy_compatible
+            and shards > 1
+            and int(x_f.shape[0]) % shards == 0
+        ):
+            # Why: torch.mm is SP-local (M=s/tp). Union F.linear at GatherOp
+            # M=s is not M-invariant with concat(shard GEMMs) at step-3
+            # (M=84 vs 42; E-511 1117 u32). Default path stays union F.linear.
+            shard = int(x_f.shape[0]) // shards
+            y = paddle.concat(
+                [
+                    F.linear(x_f[i * shard : (i + 1) * shard], w_t)
+                    for i in range(shards)
+                ],
+                axis=0,
+            )
+        else:
+            y = F.linear(x_f, w_t)
+        if getattr(ctx, "_e511_stem", None):
+            y.detach().astype("float32").cpu().numpy().tofile(
+                os.path.join(ctx._e511_dump, f"{ctx._e511_stem}_y.f32.bin")
+            )
+        return y
 
     @staticmethod
     def backward(ctx, y_grad):
@@ -257,11 +325,24 @@ class FusedGateDetachMatmul(paddle.autograd.PyLayer):
                 def _round_wgrad_through_params_dtype(g):
                     return g.cast(paddle.bfloat16).cast(paddle.float32)
 
-                x_g = paddle.matmul(y_grad, w.cast(ctx.dtype))
                 x_cast = x.cast(ctx.dtype)
+                w_cast = w.cast(ctx.dtype)
                 shards = ctx.sequence_shards
                 if shards > 1 and x_cast.shape[0] % shards == 0:
                     shard = int(x_cast.shape[0]) // shards
+                    # Why: torch.mm dgrad is SP-local (M=s/tp). Union
+                    # matmul(y_grad, W) at GatherOp M=s is not M-invariant
+                    # (E-650: 2-elem g_router at [14,4332]/[14,5133]).
+                    # Default path stays union. UAC only.
+                    x_g = paddle.concat(
+                        [
+                            paddle.matmul(
+                                y_grad[i * shard : (i + 1) * shard], w_cast
+                            )
+                            for i in range(shards)
+                        ],
+                        axis=0,
+                    )
                     w_g = _round_wgrad_through_params_dtype(
                         paddle.matmul(
                             y_grad[:shard], x_cast[:shard], transpose_x=True
@@ -275,6 +356,7 @@ class FusedGateDetachMatmul(paddle.autograd.PyLayer):
                             )
                         )
                 else:
+                    x_g = paddle.matmul(y_grad, w_cast)
                     w_g = _round_wgrad_through_params_dtype(
                         paddle.matmul(y_grad, x_cast, transpose_x=True)
                     )
@@ -1427,6 +1509,7 @@ class StandardMoERouter(nn.Layer):
 
     def set_layer_number(self, layer_number, is_mtp_layer: bool = False):
         self.layer_number = layer_number
+        self.is_mtp_layer = is_mtp_layer
         self._setup_hash_layer(layer_number, is_mtp_layer)
 
     def _setup_hash_layer(self, layer_number, is_mtp_layer: bool = False):
@@ -1529,6 +1612,9 @@ class TopKRouter(StandardMoERouter):
     def set_layer_number(self, layer_number, is_mtp_layer: bool = False):
         self._layer_number = layer_number
         self.layer_number = layer_number
+        # E-649: MTP dump gate reads getattr(self, "is_mtp_layer"). Without
+        # this assignment, moelogits never dumps on MTP (E-649 paddle miss).
+        self.is_mtp_layer = is_mtp_layer
         self._setup_hash_layer(layer_number, is_mtp_layer=is_mtp_layer)
 
     def forward(self, input, input_ids=None, origin_input_ids=None):
@@ -1698,6 +1784,29 @@ class TopKRouter(StandardMoERouter):
                 )
 
         _log_moe_md5(logits, "gate_logits", self._layer_number)
+        from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+
+        _tp = max(int(self.tensor_model_parallel_size), 1) if self.sequence_parallel else 1
+        _in_2d = input if input.ndim == 2 else input.reshape([-1, input.shape[-1]])
+        if _tp > 1 and _in_2d.shape[0] % _tp == 0:
+            _slen = int(_in_2d.shape[0]) // _tp
+            from paddlefleet.parallel_state import get_tensor_model_parallel_rank
+
+            _rk = int(get_tensor_model_parallel_rank())
+            _lo, _hi = _rk * _slen, (_rk + 1) * _slen
+        else:
+            _lo, _hi = 0, int(_in_2d.shape[0])
+        # E-649: record live gathered logits (not SP slice). Slice views
+        # inherit stop_gradient so dY hooks never fire (E-644). Dump shards
+        # at write time.
+        _e497_qa_record(
+            "moelogits",
+            _in_2d,
+            logits,
+            self.weight,
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
 
         # ---- Hash routing branch ----
         if self.is_hash_layer:
@@ -1763,6 +1872,25 @@ class TopKRouter(StandardMoERouter):
                 )
 
         _log_moe_md5(gates, "gate_probs_sigmoid", self._layer_number)
+        from paddlefleet.transformer.multi_latent_attention import _e497_qa_record as _e497_scores
+
+        _tp_s = max(int(self.tensor_model_parallel_size), 1) if self.sequence_parallel else 1
+        if _tp_s > 1 and gates.shape[0] % _tp_s == 0:
+            _slen_s = int(gates.shape[0]) // _tp_s
+            from paddlefleet.parallel_state import get_tensor_model_parallel_rank as _tp_rank_s
+
+            _rk_s = int(_tp_rank_s())
+            _lo_s, _hi_s = _rk_s * _slen_s, (_rk_s + 1) * _slen_s
+        else:
+            _lo_s, _hi_s = 0, int(gates.shape[0])
+        _e497_scores(
+            "moescores",
+            gates[_lo_s:_hi_s],
+            gates[_lo_s:_hi_s],
+            None,
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
 
         _score_dump_dir = os.environ.get("MODEL_REPRO_ROUTER_SCORES_DUMP_DIR")
         if _score_dump_dir:

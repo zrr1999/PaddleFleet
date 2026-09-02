@@ -67,6 +67,69 @@ logger = logging.getLogger(__name__)
 
 # MD5 logging for MoE precision debugging
 _LOG_LAYER_MD5 = os.environ.get("LOG_LAYER_MD5", "0") == "1"
+# E-673: FusionMoe/fused_dispatch I/O dump. Needle: [FUSION-MOE-DUMP]
+_FUSION_MOE_DUMPED = set()
+# E-674: last-decoder residual / shared. Needle: [MTP-PRE-DUMP]
+_MTP_PRE_DUMPED = set()
+
+
+def _mtp_pre_dump(tensor, name, layer_idx):
+    dump_dir = os.environ.get("MODEL_REPRO_MTP_PRE_DUMP_DIR")
+    if not dump_dir or tensor is None:
+        return
+    import paddle.distributed as _pd
+
+    rank = _pd.get_rank() if _pd.is_initialized() else 0
+    key = (name, int(layer_idx) if layer_idx is not None else -1, int(rank))
+    if key in _MTP_PRE_DUMPED:
+        return
+    _MTP_PRE_DUMPED.add(key)
+    os.makedirs(dump_dir, exist_ok=True)
+    arr = tensor.detach().astype("float32").cpu().numpy()
+    path = os.path.join(dump_dir, f"paddle_{name}_l{layer_idx}_r{rank}.f32.bin")
+    arr.tofile(path)
+    sha = hashlib.sha256(arr.tobytes()).hexdigest()
+    print(
+        f"[MTP-PRE-DUMP] {path} shape={tuple(arr.shape)} "
+        f"dtype={arr.dtype} sha16={sha[:16]}",
+        flush=True,
+    )
+
+
+def _fusion_moe_dump(tensor, name, layer_idx):
+    dump_dir = os.environ.get("MODEL_REPRO_FUSION_MOE_DUMP_DIR")
+    if not dump_dir or tensor is None:
+        return
+    import paddle.distributed as _pd
+
+    rank = _pd.get_rank() if _pd.is_initialized() else 0
+    key = (name, int(layer_idx) if layer_idx is not None else -1, int(rank))
+    if key in _FUSION_MOE_DUMPED:
+        return
+    _FUSION_MOE_DUMPED.add(key)
+    os.makedirs(dump_dir, exist_ok=True)
+    t = tensor.detach()
+    if t.dtype in (paddle.int32, paddle.int64, paddle.int8, paddle.uint8, paddle.bool):
+        arr = t.cpu().numpy()
+        if arr.dtype.kind == "i":
+            arr = arr.astype("int32")
+            ext = "i32.bin"
+        else:
+            arr = arr.astype("uint8")
+            ext = "u8.bin"
+    else:
+        arr = t.astype("float32").cpu().numpy()
+        ext = "f32.bin"
+    path = os.path.join(
+        dump_dir, f"paddle_{name}_l{layer_idx}_r{rank}.{ext}"
+    )
+    arr.tofile(path)
+    sha = hashlib.sha256(arr.tobytes()).hexdigest()
+    print(
+        f"[FUSION-MOE-DUMP] {path} shape={tuple(arr.shape)} "
+        f"dtype={arr.dtype} sha16={sha[:16]}",
+        flush=True,
+    )
 
 
 def _log_moe_md5(tensor, name, layer_idx=None):
@@ -211,7 +274,8 @@ class MoELayer(nn.Layer):
             print(
                 f"[MOE-FUSION-DEBUG] MoELayer init moe_expert_fusion={self.moe_expert_fusion} "
                 f"ep={getattr(self, 'expert_model_parallel_size', None)} "
-                f"dispatch={getattr(self, 'moe_token_dispatcher_type', None)}",
+                f"dispatch={getattr(self, 'moe_token_dispatcher_type', None)} "
+                f"fusion_node_config={getattr(config, 'moe_use_fusion_node', None)}",
                 flush=True,
             )
         if self.hidden_act == situ and (
@@ -335,6 +399,12 @@ class MoELayer(nn.Layer):
                 self.moe_deep_gemm = False
 
         self.moe_use_fusion_node = config.moe_use_fusion_node
+        print(
+            "[FUSION-NODE] MoELayer.moe_use_fusion_node="
+            f"{self.moe_use_fusion_node} ep={self.expert_model_parallel_size} "
+            f"dispatch={self.moe_token_dispatcher_type}",
+            flush=True,
+        )
         if self.expert_model_parallel_size > 1:
             if self.moe_token_dispatcher_type in ("deepep", "hybridep"):
                 self.use_hybrid_ep_backend = is_hybrid_ep_backend_selected(
@@ -839,6 +909,18 @@ class MoELayer(nn.Layer):
                 fp8_combine_grad_handle=fp8_combine_grad_handle,
             )
             return self.token_dispatcher.combine_postprocess(hidden_states)
+        # E-726: UAC+fusion zip token values clone at MoELayer.combine
+        # entry before DeepEP _comm_manager.combine. Not
+        # fused_combine_forward_func. Not ZipNode.forward. Not E-719
+        # fusion_out clone. Needle has no comma (E-690 fail-closed).
+        if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+            hidden_states = hidden_states.clone()
+            if not getattr(self, "_e726_combine_entry_clone_logged", False):
+                self._e726_combine_entry_clone_logged = True
+                print(
+                    "E-726: UAC+fusion zip token values clone at MoELayer.combine entry",
+                    flush=True,
+                )
         return self.token_dispatcher._comm_manager.combine(
             hidden_states,
             combine_overlap_handle,
@@ -997,6 +1079,76 @@ class MoELayer(nn.Layer):
         topk_indices: paddle.Tensor | None = None,
     ):
         hidden_states = self._project_to_latent(hidden_states)
+        _fusion_moe_dump(hidden_states, "pre_dispatch", self.layer_number)
+        # E-743: MTP live DeepEP routing operands rebuilt from sparse [S,E]
+        # via paddle.topk instead of the router's topk tensors. Decoder
+        # keeps router topk (E-673 decoder dispatched_hs exact; MTP
+        # pre_dispatch DIFF). Not a clone wrap of fused_combine /
+        # dispatch_postprocess. Needle has no comma (E-690 fail-closed).
+        if (
+            os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
+            and getattr(self, "is_mtp_layer", False)
+        ):
+            topk_weights = None
+            topk_indices = None
+            if not getattr(self, "_e743_mtp_sparse_topk_logged", False):
+                self._e743_mtp_sparse_topk_logged = True
+                print(
+                    "E-743: UAC+fusion MTP DeepEP operands rebuild topk from sparse routing map",
+                    flush=True,
+                )
+        # E-744: MTP live hidden into DeepEP is fp32-roundtripped then
+        # recast to the original dtype. Changes token VALUES at the
+        # dispatch entry, not routing topk (E-743), not a clone wrap of
+        # fused_combine / dispatch_postprocess. Needle has no comma
+        # (E-690 fail-closed).
+        if (
+            os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
+            and getattr(self, "is_mtp_layer", False)
+        ):
+            _hs_dtype = hidden_states.dtype
+            hidden_states = hidden_states.cast("float32").cast(_hs_dtype)
+            if not getattr(self, "_e744_mtp_hidden_fp32_rt_logged", False):
+                self._e744_mtp_hidden_fp32_rt_logged = True
+                print(
+                    "E-744: UAC+fusion MTP DeepEP hidden fp32 roundtrip before dispatch",
+                    flush=True,
+                )
+        # E-745: MTP live hidden into DeepEP is multiplied by 2. Proves
+        # whether MTP hidden values reach the main loss. E-744 fp32
+        # roundtrip was IEEE-identity on bf16. Not clone wrap, not
+        # fused_combine, not Flex dispatch_postprocess, not E-743
+        # sparse-map topk. Needle has no comma (E-690 fail-closed).
+        if (
+            os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
+            and getattr(self, "is_mtp_layer", False)
+        ):
+            hidden_states = hidden_states * 2
+            if not getattr(self, "_e745_mtp_hidden_mul2_logged", False):
+                self._e745_mtp_hidden_mul2_logged = True
+                print(
+                    "E-745: UAC+fusion MTP DeepEP hidden multiplied by 2 before dispatch",
+                    flush=True,
+                )
+        # E-746: decoder live DeepEP routing operands rebuilt from sparse
+        # [S,E] via paddle.topk instead of router topk. E-673 decoder
+        # dispatched_hs exact but indices/probs column permutation
+        # differs. E-743 did this for MTP only; E-745 proved MTP hidden
+        # is not on the main-loss path. Not clone wrap, not
+        # fused_combine, not Flex dispatch_postprocess, not MTP
+        # x2/fp32-rt/sparse-topk. Needle has no comma (E-690 fail-closed).
+        if (
+            os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
+            and not getattr(self, "is_mtp_layer", False)
+        ):
+            topk_weights = None
+            topk_indices = None
+            if not getattr(self, "_e746_decoder_sparse_topk_logged", False):
+                self._e746_decoder_sparse_topk_logged = True
+                print(
+                    "E-746: UAC+fusion decoder DeepEP operands rebuild topk from sparse routing map",
+                    flush=True,
+                )
 
         should_log_balance = framework._dygraph_tracer()._has_grad
         with profile("dispatch"):
@@ -1007,6 +1159,9 @@ class MoELayer(nn.Layer):
         dispatched_indices, dispatched_probs, tokens_per_expert = (
             self.token_dispatcher.get_dispatched_routing()
         )
+        _fusion_moe_dump(dispatched_hidden_states, "dispatched_hs", self.layer_number)
+        _fusion_moe_dump(dispatched_probs, "dispatched_probs", self.layer_number)
+        _fusion_moe_dump(dispatched_indices, "dispatched_indices", self.layer_number)
         if should_log_balance and global_moe_balance_training_logs_enabled():
             log_moe_balance(
                 self.layer_number,
@@ -1068,6 +1223,18 @@ class MoELayer(nn.Layer):
                     use_w4a8=self.use_w4a8,
                     use_w4a8_fused_quant=self.use_w4a8_fused_quant,
                 )
+                _fusion_moe_dump(hidden_states, "fusion_out", self.layer_number)
+                # E-719: UAC+fusion zip token values clone fusion_out before
+                # Buffer.combine. Not ZipNode.forward. Not E-718 contiguous.
+                # Needle has no comma (E-690 fail-closed).
+                if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+                    hidden_states = hidden_states.clone()
+                    if not getattr(self, "_e719_fusion_out_clone_logged", False):
+                        self._e719_fusion_out_clone_logged = True
+                        print(
+                            "E-719: UAC+fusion zip token values clone fusion_out before Buffer.combine",
+                            flush=True,
+                        )
 
         with profile("combine"):
             hidden_states = self.combine(
@@ -1075,6 +1242,7 @@ class MoELayer(nn.Layer):
                 combine_overlap_handle=combine_overlap_handle,
                 fp8_combine_grad_handle=fp8_combine_grad_handle,
             )
+            _fusion_moe_dump(hidden_states, "combine_out", self.layer_number)
 
         # Latent MoE: project back from latent space to hidden_size
         if self.use_latent_moe:
@@ -1387,6 +1555,55 @@ class MoELayer(nn.Layer):
             input_ids=input_ids,
             origin_input_ids=origin_input_ids,
         )
+        from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+        from paddlefleet import utils as _pfutils
+
+        # GatherOp expands [s/tp,b,h] -> [s,b,h]. Hash this TP rank's SP shard
+        # so it pairs with torch's ungathered MoE input. Slice is dump-only.
+        _tp_size = max(_pfutils.get_pg_size(self.pg_collection.tp), 1)
+        _tp_rank = _pfutils.get_pg_rank(self.pg_collection.tp)
+        _slen = int(gate_input.shape[0]) // _tp_size
+        _lo, _hi = _tp_rank * _slen, (_tp_rank + 1) * _slen
+        # E-648: record live ThreePath router-path (not SP slice). Slice views
+        # inherit stop_gradient=True so dX hooks never fire (E-644).
+        _e497_qa_record(
+            "moeroute",
+            _hs_router_path,
+            topk_weights,
+            getattr(self.gate, "e_score_correction_bias", None),
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
+        # Same-layout vs torch: routing_map/probs are [S, E] after gather; hash
+        # the local SP shard so it pairs with torch's ungathered [s/tp, E].
+        # Live mask is float32 0/1 (put_along_axis_), not bool — always recast
+        # to uint8 so the hash matches torch routing_map.uint8.
+        _map = mask[_lo:_hi].cast("uint8")
+        _e497_qa_record(
+            "moemap",
+            gate_input[_lo:_hi],
+            _map,
+            None,
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
+        _e497_qa_record(
+            "moeprobs",
+            gate_input[_lo:_hi],
+            probs[_lo:_hi],
+            None,
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
+        if topk_indices is not None and topk_indices.shape[0] == gate_input.shape[0]:
+            _e497_qa_record(
+                "moetopk",
+                gate_input[_lo:_hi],
+                topk_indices[_lo:_hi],
+                None,
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
         # topk_weights, topk_indices: Shape is [seq_len, moe_router_topk]
         # probs: combine weights in [S, E] sparse layout (non-selected positions are 0) [seq_len, num_experts]
         # mask (routing_map): binary selection matrix [seq_len, num_experts]
@@ -1518,12 +1735,34 @@ class MoELayer(nn.Layer):
 
         output = output.reshape(orig_shape)
         output = self._post_routed_output(output)
+        from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+
+        # E-645: record live tensors (not SP slices). Slice views inherit
+        # stop_gradient=True so dX/dY hooks never fire (E-644).
+        _e497_qa_record(
+            "moerouted",
+            residuals,
+            output,
+            None,
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
 
         if self.shared_experts is not None:
             if combine_overlap_handle is not None:
                 shared_output = combine_overlap_handle["fn_out"][0]
             else:
                 shared_output = self.shared_experts(residuals)[0]
+            from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+
+            _e497_qa_record(
+                "moeshared",
+                residuals,
+                shared_output,
+                None,
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
             shared_output = self._post_shared_output(shared_output)
             _moe_ds_dump2 = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR")
             if _moe_ds_dump2:
@@ -1552,7 +1791,24 @@ class MoELayer(nn.Layer):
                         f"paddle_moe_shared_output_l{layer_idx}_r{_dsrank2b}.f32.bin",
                     )
                 )
-            output = output + shared_output
+            # E-699: UAC+fusion shared-expert add uses fp32 then cast.
+            # Live Buffer.combine already returned; torch postprocess is
+            # output + shared_expert_output in bf16. Needle has no comma.
+            if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+                output = (
+                    output.cast("float32") + shared_output.cast("float32")
+                ).cast(output.dtype)
+                if not getattr(self, "_e699_shared_add_logged", False):
+                    self._e699_shared_add_logged = True
+                    print(
+                        "E-699: UAC+fusion shared-expert add uses fp32 then cast",
+                        flush=True,
+                    )
+            else:
+                output = output + shared_output
+            if os.environ.get("MODEL_REPRO_MTP_CONCAT_DUMP", "0") == "1":
+                _mtp_pre_dump(shared_output, "shared_out", layer_idx)
+                _mtp_pre_dump(output, "moe_final", layer_idx)
 
         _log_moe_md5(output, "moe_final_output", layer_idx)
         if _moe_ds_dump:
@@ -1980,6 +2236,16 @@ class MoELayer(nn.Layer):
                 tokens_per_expert,
                 use_accuracy_compatible=_use_ac,
             )
+            from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+
+            _e497_qa_record(
+                "moeperm",
+                hidden_states,
+                permuted_local_hidden_states,
+                None,
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
             _idx_dump = os.environ.get("MODEL_REPRO_UNPERM_INDEX_DUMP")
             if _idx_dump:
                 import paddle.distributed as _pdix
@@ -2041,6 +2307,16 @@ class MoELayer(nn.Layer):
                     permuted_probs=_permuted_probs,
                     row_owner=_row_owner,
                 )[0]
+                from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+
+                _e497_qa_record(
+                    "moegemm",
+                    permuted_local_hidden_states,
+                    grouped_expert_out,
+                    None,
+                    getattr(self, "layer_number", -1),
+                    getattr(self, "is_mtp_layer", False),
+                )
                 # Keep routing_map even when probs are already folded: the
                 # accuracy-compatible unpermute uses it to rebuild the
                 # token-major gather index (Megatron token_dispatcher.py
@@ -2061,6 +2337,16 @@ class MoELayer(nn.Layer):
                     tokens_per_expert,
                     row_owner=_row_owner,
                 )[0]
+                from paddlefleet.transformer.multi_latent_attention import _e497_qa_record
+
+                _e497_qa_record(
+                    "moegemm",
+                    permuted_local_hidden_states,
+                    grouped_expert_out,
+                    None,
+                    getattr(self, "layer_number", -1),
+                    getattr(self, "is_mtp_layer", False),
+                )
                 final_hidden_states = unpermute(
                     grouped_expert_out,
                     sorted_indices,
@@ -2069,6 +2355,16 @@ class MoELayer(nn.Layer):
                     routing_map=routing_map,
                     use_accuracy_compatible=_use_ac,
                 )
+            from paddlefleet.transformer.multi_latent_attention import _e497_qa_record as _e497_unperm
+
+            _e497_unperm(
+                "moeunperm",
+                grouped_expert_out,
+                final_hidden_states,
+                None,
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
             return final_hidden_states.cast(hidden_states.dtype)
 
     def fp8_quant_weight(self, batch_mode=False, quant_transpose=True):

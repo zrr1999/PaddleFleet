@@ -2226,6 +2226,33 @@ class TestFusedGateDetachMatmulAccuracyCompatible(unittest.TestCase):
         # MG casts grad_weight back to the weight storage dtype.
         self.assertEqual(w.grad.dtype, paddle.bfloat16)
 
+    def test_uac_forward_splits_sequence_shards(self):
+        """UAC forward concat of per-shard F.linear; default stays union.
+
+        Live torch.mm is SP-local (M=s/tp). Union F.linear after GatherOp is
+        not M-invariant at step-3 M=84 (E-511). sequence_shards>1 is the UAC
+        path that matches torch. Default path must not change.
+        """
+        from paddlefleet.transformer.moe.moe_router import FusedGateDetachMatmul
+
+        paddle.seed(2026)
+        m, k, n, shards = 84, 64, 16, 2
+        x = paddle.randn([m, k], dtype=paddle.float32)
+        w = paddle.randn([n, k], dtype=paddle.float32)
+        shard = m // shards
+        w_t = w.T
+        ref_shards = paddle.concat(
+            [paddle.nn.functional.linear(x[i * shard : (i + 1) * shard], w_t) for i in range(shards)],
+            axis=0,
+        )
+        ref_union = paddle.nn.functional.linear(x, w_t)
+        out_uac = FusedGateDetachMatmul.apply(x, w, False, True, shards)
+        out_default = FusedGateDetachMatmul.apply(x, w, False, False, shards)
+        np.testing.assert_array_equal(out_uac.numpy(), ref_shards.numpy())
+        np.testing.assert_array_equal(out_default.numpy(), ref_union.numpy())
+        if not np.array_equal(ref_shards.numpy(), ref_union.numpy()):
+            self.assertFalse(np.array_equal(out_uac.numpy(), out_default.numpy()))
+
 
 class TestRouterAccuracyCompatible(unittest.TestCase):
     """Cover the router-level use_accuracy_compatible branches.

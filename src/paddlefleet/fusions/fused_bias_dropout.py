@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import paddle
 
 
@@ -60,6 +62,18 @@ def _bias_dropout_add_func(x_with_bias, residual, prob, training):
         if inplace:
             out.add_(residual)
         else:
+            # E-739: disconnect E-700/E-701 UAC mlp_bda residual-order +
+            # fp32 add. Those wraps were P2E2 step-1 inert but current-graph
+            # C2 paddle first_bad moved from 7 to 2 (E-736). Restore
+            # historical `out + residual` (e652 workerlogs had no E-700/E-701).
+            # Needle has no comma.
+            if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+                if not getattr(_bias_dropout_add_func, "_e739_logged", False):
+                    _bias_dropout_add_func._e739_logged = True
+                    print(
+                        "E-739: UAC mlp_bda residual add disconnected to historical out plus residual",
+                        flush=True,
+                    )
             out = out + residual
         return out
 

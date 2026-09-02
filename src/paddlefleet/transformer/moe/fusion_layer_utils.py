@@ -15,6 +15,7 @@
 import contextlib
 import copy
 import logging
+import os
 
 import paddle
 import paddlefleet_ops
@@ -40,6 +41,54 @@ from .vmm_utils import (
     merge_subbatch_cast,
     tokens_zip_unique_add_with_subbatch,
 )
+
+# E-678: last-decoder FusionMoe unzip/group-GEMM internals. Needle: [FUSION-GEMM-DUMP]
+_FUSION_GEMM_DUMPED = set()
+
+
+def _fusion_gemm_dump(tensor, name, layer_idx):
+    dump_dir = os.environ.get("MODEL_REPRO_FUSION_GEMM_DUMP_DIR") or os.environ.get(
+        "MODEL_REPRO_O2_DUMP_DIR"
+    )
+    if not dump_dir or tensor is None:
+        return
+    import hashlib
+    import os as _os
+
+    import paddle.distributed as _pd
+
+    rank = _pd.get_rank() if _pd.is_initialized() else 0
+    key = (name, int(layer_idx) if layer_idx is not None else -1, int(rank))
+    if key in _FUSION_GEMM_DUMPED:
+        return
+    _FUSION_GEMM_DUMPED.add(key)
+    _os.makedirs(dump_dir, exist_ok=True)
+    t = tensor.detach() if hasattr(tensor, "detach") else tensor
+    if hasattr(t, "dtype") and t.dtype in (
+        paddle.int32,
+        paddle.int64,
+        paddle.int8,
+        paddle.uint8,
+        paddle.bool,
+    ):
+        arr = t.cpu().numpy()
+        if arr.dtype.kind == "i":
+            arr = arr.astype("int32")
+            ext = "i32.bin"
+        else:
+            ext = "u8.bin"
+    else:
+        arr = t.astype("float32").cpu().numpy() if hasattr(t, "astype") else t
+        ext = "f32.bin"
+    path = _os.path.join(dump_dir, f"paddle_{name}_l{layer_idx}_r{rank}.{ext}")
+    arr.tofile(path)
+    sha = hashlib.sha256(arr.tobytes()).hexdigest()
+    print(
+        f"[FUSION-GEMM-DUMP] {path} shape={tuple(arr.shape)} "
+        f"dtype={arr.dtype} sha16={sha[:16]}",
+        flush=True,
+    )
+
 
 if paddlefleet_ops.is_sonic_moe_available():
     from paddlefleet_ops.sonicmoe.enums import ActivationType
@@ -254,6 +303,66 @@ class UnZipNode:
 
         self.unzipped_probs = unzipped_probs
         self.zipped_expertwise_rowmap = zipped_expertwise_rowmap
+        # E-722: UAC+fusion zip token values contiguous unzipped_tokens
+        # after moe_permute. GEMM/zip input layout; not ZipNode.forward
+        # scatter. Needle has no comma (E-690 fail-closed).
+        if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+            if unzipped_tokens is not None:
+                unzipped_tokens = unzipped_tokens.contiguous()
+            if not getattr(self, "_e722_unzip_contig_logged", False):
+                self._e722_unzip_contig_logged = True
+                print(
+                    "E-722: UAC+fusion zip token values contiguous unzipped_tokens after moe_permute",
+                    flush=True,
+                )
+            # E-723: UAC+fusion zip token values gather unzipped_tokens via
+            # index_select like torch permute not C++ moe_permute. Torch
+            # moe_utils.permute is routing_map.T argsort then
+            # tokens.index_select(0 sorted_indices). Keep moe_permute for
+            # rowmap/probs. Not ZipNode.forward scatter. Needle has no comma.
+            if (
+                fill_output
+                and unzipped_tokens is not None
+                and scale is None
+            ):
+                rowmap = zipped_expertwise_rowmap
+                n_tokens = int(rowmap.shape[0])
+                n_experts = int(rowmap.shape[1])
+                n_src = (
+                    int(unzipped_tokens.shape[0])
+                    if len(unzipped_tokens.shape) > 0
+                    else 0
+                )
+                if n_src > 0 and n_tokens > 0:
+                    rowmap_t = paddle.transpose(
+                        rowmap, perm=[1, 0]
+                    ).contiguous()
+                    valid_t = rowmap_t >= 0
+                    token_ids_t = paddle.arange(
+                        n_tokens, dtype="int64"
+                    ).unsqueeze(0).expand([n_experts, -1])
+                    src_i = token_ids_t.masked_select(valid_t)
+                    n_valid = int(src_i.shape[0])
+                    gathered = paddle.index_select(hidden_states, src_i, axis=0)
+                    if n_valid == n_src:
+                        unzipped_tokens = gathered
+                    elif n_valid < n_src:
+                        pad = paddle.zeros(
+                            [n_src, int(hidden_states.shape[-1])],
+                            dtype=hidden_states.dtype,
+                        )
+                        pad[:n_valid] = gathered
+                        unzipped_tokens = pad
+                    else:
+                        raise RuntimeError(
+                            f"E-723 n_valid={n_valid} > unzipped rows={n_src}"
+                        )
+            if not getattr(self, "_e723_unzip_index_select_logged", False):
+                self._e723_unzip_index_select_logged = True
+                print(
+                    "E-723: UAC+fusion zip token values gather unzipped_tokens via index_select like torch permute",
+                    flush=True,
+                )
         return (
             unzipped_tokens,
             zipped_expertwise_rowmap,
@@ -323,6 +432,101 @@ class ZipNode:
         num_experts,
     ):
         with paddle.amp.auto_cast(False):
+            # E-693: UAC+fusion zip uses fp32 scatter unpermute not moe_unpermute.
+            # Torch DeepEP combine_preprocess calls unpermute(..., probs=None) and
+            # scatter_add_ in fp32. Fusion already scaled by unzipped_probs in
+            # fwd_down; do not re-weight. Needle has no comma (E-690 fail-closed).
+            if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+                hidden = int(expert_out.shape[-1])
+                rowmap = zipped_expertwise_rowmap
+                n_tokens = int(rowmap.shape[0])
+                n_experts = int(rowmap.shape[1])
+                # E-720 disconnected: ZipNode bf16 accum moved paddle step-1
+                # 12.28316879 -> 12.283261 bits 0x4144883d away from torch;
+                # first_bad still 1. Torch UAC DeepEP unpermute(probs=None)
+                # is _fp32_accum_unpermute (fp32 scatter_add then cast bf16).
+                # Restore fp32 accum then cast. Megatron moe_utils.py 431-520
+                # is permute forward, not this unpermute path.
+                output = paddle.zeros([n_tokens, hidden], dtype="float32")
+                n_src = int(expert_out.shape[0]) if len(expert_out.shape) > 0 else 0
+                if n_src > 0 and n_tokens > 0:
+                    src_f = expert_out.cast("float32")
+                    # E-707: restore mapping walks expert-major like torch
+                    # unpermute scatter_add of sorted_indices (routing_map.T
+                    # flatten). E-693 token-major masked_select is a different
+                    # injector and is closed as a 0diff closer. Needle has no
+                    # comma (E-690 fail-closed).
+                    rowmap_t = paddle.transpose(rowmap, perm=[1, 0]).contiguous()
+                    valid_t = rowmap_t >= 0
+                    token_ids_t = paddle.arange(
+                        n_tokens, dtype="int64"
+                    ).unsqueeze(0).expand([n_experts, -1])
+                    dst_i = token_ids_t.masked_select(valid_t)
+                    n_valid = int(dst_i.shape[0])
+                    if n_valid > 0:
+                        # E-708: zip packing uses sequential packed expert_out
+                        # rows like torch unpermute scatter_add of
+                        # permuted_tokens, not gather via rowmap src_i.
+                        # E-707 already walks dst expert-major. Needle has
+                        # no comma (E-690 fail-closed).
+                        if n_valid > n_src:
+                            raise RuntimeError(
+                                f"E-708 n_valid={n_valid} > expert_out rows={n_src}"
+                            )
+                        # E-717: zip token values use index_add_ like torch
+                        # unpermute non-UAC path not scatter_add_ 2D.
+                        # Torch unpermute without UAC is
+                        # index_add_(0, sorted_indices, permuted_tokens).
+                        # E-715 2D scatter_add_ was inert. Needle has no comma.
+                        output.index_add_(0, dst_i, src_f[:n_valid])
+                if not getattr(self, "_e693_zip_logged", False):
+                    self._e693_zip_logged = True
+                    print(
+                        "E-693: UAC+fusion zip uses fp32 scatter unpermute not moe_unpermute",
+                        flush=True,
+                    )
+                if not getattr(self, "_e707_zip_logged", False):
+                    self._e707_zip_logged = True
+                    print(
+                        "E-707: UAC+fusion zip restore mapping uses expert-major scatter like torch unpermute",
+                        flush=True,
+                    )
+                if not getattr(self, "_e708_zip_logged", False):
+                    self._e708_zip_logged = True
+                    print(
+                        "E-708: UAC+fusion zip packing uses sequential packed rows not rowmap gather",
+                        flush=True,
+                    )
+                if not getattr(self, "_e715_zip_logged", False):
+                    self._e715_zip_logged = True
+                    print(
+                        "E-715: UAC+fusion zip token values use scatter_add like torch unpermute not scatter overwrite=False",
+                        flush=True,
+                    )
+                if not getattr(self, "_e717_zip_logged", False):
+                    self._e717_zip_logged = True
+                    print(
+                        "E-717: UAC+fusion zip token values use index_add like torch unpermute not scatter_add",
+                        flush=True,
+                    )
+                # E-706 disconnected: keep-fp32 into combine moved paddle
+                # step-1 12.28316879 -> 12.270207; first_bad still 1.
+                # Torch UAC unpermute also returns permuted_tokens.dtype
+                # (bf16) before Buffer.combine. Restore bf16 combine operands.
+                zipped = output.cast(expert_out.dtype)
+                # E-732: UAC+fusion zip token values reshape+contiguous at
+                # ZipNode return. Not fused_combine_forward_func. Not
+                # ZipNode index_add/scatter. Not E-715-E-727 clones.
+                # Needle has no comma (E-690 fail-closed).
+                if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+                    zipped = zipped.reshape(zipped.shape).contiguous()
+                    if not getattr(self, "_e732_zip_reshape_logged", False):
+                        self._e732_zip_reshape_logged = True
+                        print(
+                            "E-732: UAC+fusion zip token values reshape contiguous at ZipNode return",
+                            flush=True,
+                        )
+                return zipped
             expert_out_zipped, zipped_probs_topk = (
                 paddle.nn.functional.moe_unpermute(
                     expert_out,
@@ -398,6 +602,7 @@ class MlpNode:
         Constructor
         """
         self.token_dispatcher = custom_map.token_dispatcher
+        self.layer_number = getattr(custom_map, "layer_number", -1)
         self.moe_expert_fusion = moe_expert_fusion
         self.experts = getattr(custom_map, "experts", None)
         if activation_type is None:
@@ -405,9 +610,20 @@ class MlpNode:
         self.activation_type = activation_type
 
         self.moe_rank = getattr(custom_map, "moe_rank", 0)
-        self.tokens_per_expert = (
-            self.token_dispatcher._comm_manager.tokens_per_expert
-        )
+        # E-687: snapshot unzip/comm-manager counts as a Python list. The live
+        # reference was later overwritten (E-686 dump [0,12,..] vs E-678 [1,24,..]).
+        _tpe = self.token_dispatcher._comm_manager.tokens_per_expert
+        if hasattr(_tpe, "detach"):
+            _tpe = _tpe.detach()
+        if hasattr(_tpe, "cpu"):
+            try:
+                _tpe = _tpe.cpu()
+            except Exception:
+                pass
+        if hasattr(_tpe, "tolist"):
+            self.tokens_per_expert = [int(x) for x in _tpe.tolist()]
+        else:
+            self.tokens_per_expert = [int(x) for x in list(_tpe)]
         self.num_experts_per_device = getattr(
             custom_map,
             "num_experts_per_device",
@@ -2843,6 +3059,23 @@ class MlpNode:
             fill_output=fill_output,
             padding_alignment=self.moe_permute_padding_alignment,
         )
+        _layer = getattr(self, "layer_number", None)
+        if _layer is None:
+            _layer = getattr(self.token_dispatcher, "layer_number", -1)
+        _fusion_gemm_dump(unzipped_tokens, "unzipped_hs", _layer)
+        _fusion_gemm_dump(unzipped_probs, "unzipped_probs", _layer)
+        if self.tokens_per_expert is not None:
+            _fusion_gemm_dump(
+                paddle.to_tensor(self.tokens_per_expert, dtype="int32"),
+                "tokens_per_expert",
+                _layer,
+            )
+        if self.padding_token_per_experts is not None:
+            _fusion_gemm_dump(
+                paddle.to_tensor(self.padding_token_per_experts, dtype="int32"),
+                "padded_tokens_per_expert",
+                _layer,
+            )
 
         fwd_path = "unknown"
         if (
@@ -2925,13 +3158,36 @@ class MlpNode:
             fwd_path = "group_gemm"
             if not use_fp8_dispatch_a2a:
                 hs_2d_dispatched._clear_to_zero_allocation()
+            # E-686: stash FusionMoe self.tokens_per_expert BEFORE group GEMM
+            # so pad-block valid o1 dump uses unzip counts, not comm-manager.
+            if os.environ.get("MODEL_REPRO_FUSIONMOE_O1_DUMP_DIR"):
+                self.experts_group_gemm_node._e686_real_tpe = self.tokens_per_expert
+                self.experts_group_gemm_node._e686_pad_tpe = self.padding_token_per_experts
+            # E-687: group GEMM M dim = unzip/real tokens_per_expert when
+            # alignment=1 (UAC+bf16). 128-pad layout still uses padded counts.
+            _gemm_tpe = self.tokens_per_expert
+            if self.moe_permute_padding_alignment > 1:
+                _gemm_tpe = self.padding_token_per_experts
+            # E-714: UAC+fusion zip token values use a dedicated GEMM
+            # output buffer not unzipped_tokens alias. Torch SequentialMLP
+            # writes expert_out to a new tensor. Needle has no comma.
+            _gemm_out = unzipped_tokens
+            if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+                _gemm_out = None
+                if not getattr(self, "_e714_gemm_out_logged", False):
+                    self._e714_gemm_out_logged = True
+                    print(
+                        "E-714: UAC+fusion zip token values use dedicated GEMM output not unzipped-tokens alias",
+                        flush=True,
+                    )
             expert_out = self.experts_group_gemm_node.forward(
                 unzipped_tokens,
                 unzipped_probs,
-                self.padding_token_per_experts,
-                output=unzipped_tokens,
+                _gemm_tpe,
+                output=_gemm_out,
                 scale=unzipped_scale,  # maybe None
             )
+            _fusion_gemm_dump(expert_out, "group_gemm_out", _layer)
 
             expert_out = expert_out.reshape([-1, expert_out.shape[-1]])
 
@@ -2943,6 +3199,18 @@ class MlpNode:
                 total_zipped_tokens=total_zipped_tokens,
                 num_experts=num_experts,
             )
+            # E-718: UAC+fusion zip token values contiguous before
+            # Buffer.combine. ZipNode.forward consecutive inert (E-715/E-717).
+            # New injection point is FusionMoe.forward after zip return.
+            # Needle has no comma (E-690 fail-closed).
+            if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+                expert_out = expert_out.contiguous()
+                if not getattr(self, "_e718_zip_contig_logged", False):
+                    self._e718_zip_contig_logged = True
+                    print(
+                        "E-718: UAC+fusion zip token values contiguous before Buffer.combine",
+                        flush=True,
+                    )
 
         self.dispatched_probs = dispatched_probs
         expert_out.stop_gradient = False
@@ -3206,6 +3474,18 @@ class FusionMoePyLayer(paddle.autograd.PyLayer):
             cached_tensors = ctx.node.cached_tensors()
             ctx.save_for_backward(cached_tensors)
             ctx.node.clear_cached_tensors()
+        # E-733: UAC+fusion zip token values clone at FusionMoePyLayer
+        # return. Not fused_combine_forward_func. Not ZipNode.forward.
+        # Not E-719 moe_layer fusion_out clone (that wraps apply()
+        # result after this PyLayer returns). Needle has no comma.
+        if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+            out = out.clone()
+            if not getattr(FusionMoePyLayer, "_e733_pylayer_clone_logged", False):
+                FusionMoePyLayer._e733_pylayer_clone_logged = True
+                print(
+                    "E-733: UAC+fusion zip token values clone at FusionMoePyLayer return",
+                    flush=True,
+                )
         return out
 
     @staticmethod

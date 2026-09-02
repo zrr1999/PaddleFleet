@@ -81,7 +81,18 @@ class StandardMLPSharedExpert(MLP):
                 _os.path.join(_dd, f"paddle_sh_fc1_in_{_li}_r{_rk}.f32.bin")
             )
         output, output_bias = None, None
-        if os.environ.get("MODEL_REPRO_MOE_SHARED_TN", "0") == "1":
+        # E-704: UAC+fusion shared expert fc1 uses TN matmul. Targets MoE Y
+        # values (shared GEMM) not mlp_bda clone/add. Needle has no comma.
+        if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1" or os.environ.get(
+            "MODEL_REPRO_MOE_SHARED_TN", "0"
+        ) == "1":
+            if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+                if not getattr(self, "_e704_logged", False):
+                    self._e704_logged = True
+                    print(
+                        "E-704: UAC+fusion shared expert fc1 uses TN matmul",
+                        flush=True,
+                    )
             # E-139/E-115: shared fc1 (K=6144 -> N=2048) differs by 1 ULP between
             # paddle F.linear and torch linear (333/122880 at M=60), while the
             # TN-materialized matmul (matmul(x, w.t().contiguous(),

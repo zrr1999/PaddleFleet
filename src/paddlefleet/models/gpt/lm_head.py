@@ -60,6 +60,7 @@
 #     produce identical math at step 0 (params init to zero -> SegLU = id).
 # =============================================================================
 
+import os
 import warnings
 
 import paddle
@@ -303,6 +304,72 @@ class GPTLMHead(ColumnParallelLinear):
 
         return logits
 
+    def _e633_maybe_dump_lmh(self, lmh_x, logits):
+        # E-633 dump-off: last-stage seq=18 main lm_head X/Y/dY. Observation only.
+        # Live path is GPTLMHead.forward (MTP concat-split), not GPTMainLMHead.
+        if not os.environ.get("MODEL_REPRO_FLN_BIN_DIR"):
+            return
+        if logits is None or isinstance(logits, (tuple, list)):
+            return
+        import json
+
+        import paddle.distributed as dist
+
+        _bin = os.environ["MODEL_REPRO_FLN_BIN_DIR"]
+        _rank = dist.get_rank() if dist.is_initialized() else 0
+        _seq = int(lmh_x.shape[0]) if getattr(lmh_x, "ndim", 0) >= 2 else 0
+        if int(_rank) not in (2, 3) or _seq not in (18, 36):
+            return
+        os.makedirs(_bin, exist_ok=True)
+        if not hasattr(self, "_e633_lmh_calls"):
+            self._e633_lmh_calls = {}
+        _key = f"lmh|-1|0|{_rank}"
+        self._e633_lmh_calls[_key] = self._e633_lmh_calls.get(_key, 0) + 1
+        _call = self._e633_lmh_calls[_key]
+
+        def _e633_write(stem, t, kind, *, _dump=_bin, _rank=_rank, _call=_call):
+            arr = t.detach().contiguous()
+            u16 = arr.view(dtype="uint16").cpu().numpy()
+            u16.tofile(os.path.join(_dump, f"{stem}.u16.bin"))
+            meta = {
+                "framework": "paddle",
+                "kind": kind,
+                "tag": "lmh",
+                "rank": int(_rank),
+                "layer": -1,
+                "mtp": 0,
+                "call": int(_call),
+                "shape": list(arr.shape),
+                "dtype": str(arr.dtype),
+                "suffix": "u16",
+            }
+            with open(os.path.join(_dump, f"{stem}.json"), "w", encoding="utf-8") as handle:
+                json.dump(meta, handle, sort_keys=True)
+                handle.write("\n")
+
+        _stem = f"paddle_lmh_r{_rank}_c{_call}_L-1"
+        _e633_write(f"{_stem}_x", lmh_x, "x")
+        _e633_write(f"{_stem}_y", logits, "y")
+        if os.environ.get("MODEL_REPRO_DUMP_LMH_W") == "1":
+            _w = getattr(self, "weight", None)
+            if _w is not None:
+                _e633_write(f"{_stem}_w", _w, "w")
+        if not getattr(self, "_e633_lmh_announced", False):
+            print(
+                f"[E633-LMH-BIN] dir={_bin} rank={_rank} call={_call}",
+                flush=True,
+            )
+            self._e633_lmh_announced = True
+
+        def _on_lmh_dy(g, *, _stem=_stem):
+            if g is None:
+                return g
+            _e633_write(f"{_stem}_dy", g, "dy")
+            return g
+
+        if getattr(logits, "stop_gradient", True) is False:
+            logits.register_hook(_on_lmh_dy)
+
     def forward(self, dict_args: dict):
         hidden_states = dict_args["hidden_states"]
 
@@ -318,9 +385,12 @@ class GPTLMHead(ColumnParallelLinear):
             logits = [self._forward(tensor_list[0])]
             for i in range(self.config.num_nextn_predict_layers):
                 logits.append(self._forward(tensor_list[i + 1]))
+            self._e633_maybe_dump_lmh(tensor_list[0], logits[0])
             return logits
         else:
-            return self._forward(hidden_states)
+            y = self._forward(hidden_states)
+            self._e633_maybe_dump_lmh(hidden_states, y)
+            return y
 
     @property
     def embedding_weight(self):

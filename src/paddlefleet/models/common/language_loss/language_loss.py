@@ -55,6 +55,32 @@ def _use_accuracy_compatible_kernel() -> bool:
     return os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
 
 
+def _accuracy_compatible_cross_entropy(
+    logits: Tensor, labels: Tensor, ignored_index: int
+) -> Tensor:
+    """IEEE TP=1 UAC CE: Megatron-style sentinel CE, not paddle.nn.CrossEntropyLoss."""
+    from paddlefleet.tensor_parallel import vocab_parallel_cross_entropy
+
+    labels = paddle.where(
+        labels == ignored_index, paddle.zeros_like(labels), labels
+    )
+    return vocab_parallel_cross_entropy(logits, labels)
+
+
+def _uac_vocab_parallel_ce(logits: Tensor, labels: Tensor) -> Tensor:
+    """IEEE e468 needle name for TP>1 UAC vocab-parallel CE."""
+    from paddlefleet.tensor_parallel.cross_entropy import (
+        vocab_parallel_cross_entropy,
+    )
+
+    if logits.ndim == 3 and labels.ndim == 2:
+        lg = logits.transpose([1, 0, 2])
+        lb = labels.transpose([1, 0])
+        loss = vocab_parallel_cross_entropy(lg, lb)
+        return loss.transpose([1, 0])
+    return vocab_parallel_cross_entropy(logits, labels)
+
+
 def _tensor_md5(tensor: Tensor, dtype: str = "float32") -> str:
     """Calculate MD5 hash of a tensor, **for debugging only**.
 
@@ -359,8 +385,30 @@ class LanguageLoss(FleetLayer):
         )
 
         if self.enable_parallel_cross_entropy:
-            self.loss_func = (
-                paddle.distributed.fleet.meta_parallel.ParallelCrossEntropy()
+            if _use_accuracy_compatible_kernel():
+                # E-608: Megatron-aligned vocab-parallel CE (paddlefleet
+                # _VocabParallelCrossEntropy). Default path stays fleet
+                # ParallelCrossEntropy / _c_softmax_with_cross_entropy.
+                self.loss_func = _uac_vocab_parallel_ce
+                print(
+                    "[UAC-CE] LanguageLoss.loss_func="
+                    "vocab_parallel_cross_entropy "
+                    f"live_tp={get_tensor_model_parallel_world_size()}",
+                    flush=True,
+                )
+            else:
+                self.loss_func = (
+                    paddle.distributed.fleet.meta_parallel.ParallelCrossEntropy()
+                )
+        elif _use_accuracy_compatible_kernel():
+            self.loss_func = functools.partial(
+                _accuracy_compatible_cross_entropy,
+                ignored_index=self.ignored_index,
+            )
+            print(
+                "[UAC-CE] LanguageLoss.loss_func="
+                "_accuracy_compatible_cross_entropy live_tp=1",
+                flush=True,
             )
         else:
             self.loss_func = paddle.nn.CrossEntropyLoss(

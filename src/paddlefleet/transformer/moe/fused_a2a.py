@@ -435,6 +435,29 @@ def fused_dispatch_forward_func(
     # Do MoE dispatch
     # NOTES: the CPU will wait for GPU's signal to arrive,
     # so this is not compatible with CUDA graph
+    dispatch_kwargs = {}
+    if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+        # E-697: UAC+fusion Buffer.dispatch uses torch get_dispatch_config.
+        # Paddle EP=2 is Config(num_sms 16 256 6 128); torch is (num_sms 24 256 6 128).
+        # That layout feeds src_idx/send_head into intranode_combine.
+        # E-696 closed combine-config identity not this dispatch layout.
+        # Needle has no comma (E-690 fail-closed).
+        _ep = int(group.world_size)
+        _torch_dispatch = {
+            2: (24, 256, 6, 128),
+            4: (6, 256, 6, 128),
+            8: (6, 256, 6, 128),
+        }
+        if _ep in _torch_dispatch:
+            dispatch_kwargs["config"] = deep_ep.Config(
+                deep_ep.Buffer.num_sms, *_torch_dispatch[_ep]
+            )
+            if not getattr(fused_dispatch_forward_func, "_e697_logged", False):
+                fused_dispatch_forward_func._e697_logged = True
+                print(
+                    "E-697: UAC+fusion Buffer.dispatch uses torch get_dispatch_config",
+                    flush=True,
+                )
     (
         recv_x,
         recv_token_indices,
@@ -453,6 +476,7 @@ def fused_dispatch_forward_func(
         previous_event=previous_event,
         async_finish=async_finish,
         allocate_on_comm_stream=allocate_on_comm_stream,
+        **dispatch_kwargs,
     )
 
     states = {}
@@ -490,6 +514,200 @@ def fused_dispatch_backward_func(
     return grad_x, None, grad_token_probs
 
 
+def _e698_host_array(t):
+    """Copy a DeepEP handle tensor to numpy after a device sync. Do not alias."""
+    import numpy as np
+
+    if t is None:
+        return None
+    paddle.device.synchronize()
+    if hasattr(t, "numpy"):
+        return np.asarray(t.numpy())
+    if hasattr(t, "detach"):
+        return np.asarray(t.detach().cpu().numpy())
+    return np.asarray(t)
+
+
+def _e698_fp32_intranode_combine(x, group, handle):
+    """Replace C++ intranode::combine with host fp32 all_gather_object + scatter.
+
+    Kernel formula (intranode.cu combine recv): each original token sums
+    bf16 contributions from dest ranks 0..EP-1 in that order into fp32,
+    then casts back. E-693 taught per-call scatter_ does not accumulate.
+    GPU alltoall IMA on retry 1/2: do the exchange on host numpy so the
+    DeepEP NVLink buffer is untouched until Buffer.combine drains it.
+    """
+    import numpy as np
+
+    with paddle.no_grad():
+        rank_prefix_matrix, _, _, src_idx, _, send_head = handle
+        rpm_np = _e698_host_array(rank_prefix_matrix)
+        src_np = _e698_host_array(src_idx).reshape(-1).astype("int64")
+        x_np = _e698_host_array(x.detach().contiguous())
+        num_recv = int(send_head.shape[0])
+        ep = int(group.world_size)
+        my = int(group.rank)
+        hidden = int(x.shape[1])
+        n_local = int(x_np.shape[0])
+        expected = int(rpm_np[ep - 1, my]) if ep > 0 else 0
+        if n_local != expected:
+            raise RuntimeError(
+                f"E-698 n_local={n_local} != rank_prefix[{ep-1},{my}]={expected}"
+            )
+        if int(src_np.shape[0]) != n_local:
+            raise RuntimeError(
+                f"E-698 src_idx len={src_np.shape[0]} != n_local={n_local}"
+            )
+
+        def _span(src, dst):
+            end = int(rpm_np[src, dst])
+            start = int(rpm_np[src - 1, dst]) if src > 0 else 0
+            return start, end
+
+        payload = []
+        for dst in range(ep):
+            start, end = _span(dst, my)
+            if end < start or start < 0 or end > n_local:
+                raise RuntimeError(
+                    f"E-698 rank_prefix span invalid src={dst} dst={my} "
+                    f"start={start} end={end} n_local={n_local}"
+                )
+            payload.append(
+                {
+                    "dst": int(dst),
+                    "x": np.ascontiguousarray(x_np[start:end]),
+                    "idx": np.ascontiguousarray(src_np[start:end]),
+                }
+            )
+        gathered = [None] * ep
+        paddle.distributed.all_gather_object(gathered, payload, group=group)
+        output_np = np.zeros((num_recv, hidden), dtype=np.float32)
+        for src, parts in enumerate(gathered):
+            if parts is None:
+                raise RuntimeError(f"E-698 all_gather_object missing src={src}")
+            mine = None
+            for part in parts:
+                if int(part["dst"]) == my:
+                    mine = part
+                    break
+            if mine is None:
+                raise RuntimeError(
+                    f"E-698 missing payload from src={src} for dst={my}"
+                )
+            chunk = np.asarray(mine["x"])
+            idx = np.asarray(mine["idx"]).reshape(-1)
+            if chunk.size == 0:
+                continue
+            if chunk.ndim != 2 or int(chunk.shape[1]) != hidden:
+                raise RuntimeError(
+                    f"E-698 chunk shape {chunk.shape} hidden={hidden} src={src}"
+                )
+            if int(idx.shape[0]) != int(chunk.shape[0]):
+                raise RuntimeError(
+                    f"E-698 idx {idx.shape} vs chunk {chunk.shape} src={src}"
+                )
+            valid = (idx >= 0) & (idx < int(num_recv))
+            if not np.any(valid):
+                continue
+            dst_i = idx[valid]
+            src_f = chunk[valid].astype(np.float32, copy=False)
+            np.add.at(output_np, dst_i, src_f)
+        out = paddle.to_tensor(output_np).cast(x.dtype)
+        out.stop_gradient = False
+        return out
+
+
+def _e706_handle_to_paddle(t, dtype):
+    """DeepEP handle tensors are torch; zip tokens are paddle. Copy ints only."""
+    if hasattr(t, "detach"):
+        arr = t.detach().cpu().numpy()
+    elif hasattr(t, "numpy"):
+        arr = t.numpy()
+    else:
+        arr = t
+    return paddle.to_tensor(arr, dtype=dtype)
+
+
+def _e706_fp32_gpu_combine(x, group, handle):
+    """GPU dest-rank 0..EP-1 scatter_add of fp32 zip tokens.
+
+    C++ intranode::combine SWITCH_TYPES is CUDA_R_16BF only, so Buffer.combine
+    cannot see ZipNode fp32. Kernel reduce is dest ranks 0..EP-1 bf16->fp32
+    then cast. This helper uses the same dest-rank order on fp32 zip tokens
+    after Buffer.combine has drained NVLink queues. Not E-698 host numpy.
+    """
+    rank_prefix_matrix, _, _, src_idx, _, send_head = handle
+    ep = int(group.world_size)
+    my = int(group.rank)
+    num_recv = int(send_head.shape[0])
+    hidden = int(x.shape[1])
+    x_f = x.detach().cast("float32").contiguous()
+    place = x_f.place
+    rpm = _e706_handle_to_paddle(rank_prefix_matrix, "int32")._copy_to(place, False)
+    idx = _e706_handle_to_paddle(src_idx, "int64").reshape([-1])._copy_to(place, False)
+    n_local = int(x_f.shape[0])
+    rpm_np = rpm.numpy()
+    expected = int(rpm_np[ep - 1, my]) if ep > 0 else 0
+    if n_local != expected:
+        raise RuntimeError(
+            f"E-706 n_local={n_local} != rank_prefix[{ep-1},{my}]={expected}"
+        )
+    n_t = paddle.full([1], n_local, dtype="int32")._copy_to(place, False)
+    n_list = []
+    paddle.distributed.all_gather(n_list, n_t, group=group)
+    max_n = 0
+    for t in n_list:
+        max_n = max(max_n, int(t.numpy()[0]))
+    pad_x = paddle.zeros([max_n, hidden], dtype="float32")._copy_to(place, False)
+    pad_idx = paddle.full([max_n], -1, dtype="int64")._copy_to(place, False)
+    if n_local > 0:
+        pad_x[:n_local] = x_f
+        pad_idx[:n_local] = idx[:n_local]
+    gx, gi, gr = [], [], []
+    paddle.distributed.all_gather(gx, pad_x, group=group)
+    paddle.distributed.all_gather(gi, pad_idx, group=group)
+    paddle.distributed.all_gather(gr, rpm, group=group)
+    output = paddle.zeros([num_recv, hidden], dtype="float32")._copy_to(place, False)
+    for src in range(ep):
+        rpm_s = gr[src].numpy()
+        # Sender src lays x out by dest: chunk for dest my is rpm[my-1, src]:rpm[my, src].
+        end = int(rpm_s[my, src])
+        start = int(rpm_s[my - 1, src]) if my > 0 else 0
+        if end < start or start < 0 or end > max_n:
+            raise RuntimeError(
+                f"E-706 span invalid src={src} dst={my} start={start} end={end} max_n={max_n}"
+            )
+        if end <= start:
+            continue
+        chunk = gx[src][start:end]
+        dst_i = gi[src][start:end]
+        valid = (dst_i >= 0) & (dst_i < num_recv)
+        n_valid = int(valid.cast("int32").sum())
+        if n_valid <= 0:
+            continue
+        valid_pos = paddle.nonzero(valid).reshape([-1])
+        output.scatter_(
+            index=dst_i.index_select(axis=0, index=valid_pos),
+            updates=chunk.index_select(axis=0, index=valid_pos),
+            overwrite=False,
+        )
+    out = output.cast("bfloat16")
+    out.stop_gradient = False
+    return out
+
+
+def _e709_bf16_gpu_combine(x, group, handle):
+    """GPU dest-rank 0..EP-1 scatter_add of live bf16 zip tokens.
+
+    E-706 closed keep-fp32 ZipNode into this helper. This call site is
+    Buffer.combine of already-bf16 ZipNode output after E-708 packing.
+    Drain NVLink with Buffer.combine first; then reduce equal packed
+    restore tokens dest-rank 0..EP-1 in fp32 and cast. Not E-698 host
+    numpy. Needle has no comma (E-690 fail-closed).
+    """
+    return _e706_fp32_gpu_combine(x, group, handle)
+
+
 def fused_combine_forward_func(
     x,
     group,
@@ -504,14 +722,94 @@ def fused_combine_forward_func(
         barrier_ep(group)
 
     handle = states["handle"]
+    # E-698 host fp32 reconstruction closed as a 0diff closer: unique-ckpt
+    # N=5 moved paddle step-1 12.28316879 -> 13.44620323; first_bad still 1.
+    # Leave Buffer.combine as the live path (E-697 graph). Needle kept below
+    # for receipt grep of this closed injector only.
+    # E-706 disconnected: ZipNode-keep-fp32 + GPU dest-rank scatter_add
+    # moved paddle step-1 12.28316879 -> 12.270207; first_bad still 1.
+    # Torch unpermute returns bf16 before Buffer.combine. Helper remains
+    # unused. Live path Buffer.combine of ZipNode bf16.
     buffer = get_buffer(group, get_hidden_bytes(x))
+    # E-695: UAC+fusion Buffer.combine uses torch token_combine async wait.
+    # Torch FusedCombine.forward: async_finish=True allocate_on_comm_stream=True
+    # then after_event.current_stream_wait. Needle has no comma (E-690 fail-closed).
+    if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+        async_finish = True
+        allocate_on_comm_stream = True
+        if previous_event is None:
+            from paddlefleet_ops.deep_ep.utils import EventHandle, EventOverlap as _EO
+
+            previous_event = _EO(EventHandle())
+        if not getattr(fused_combine_forward_func, "_e695_logged", False):
+            fused_combine_forward_func._e695_logged = True
+            print(
+                "E-695: UAC+fusion Buffer.combine uses torch token_combine async wait",
+                flush=True,
+            )
+    combine_config = None
+    if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+        # E-696: UAC+fusion Buffer.combine uses torch get_combine_config.
+        # Paddle EP=2 is Config(num_sms 6 256 6 128); torch is (num_sms 10 256 6 128).
+        # E-672 closed num_sms=20 identity not this NVL-chunk. Needle has no comma.
+        _ep = int(group.world_size)
+        _torch_combine = {
+            2: (10, 256, 6, 128),
+            4: (9, 256, 6, 128),
+            8: (4, 256, 6, 128),
+        }
+        if _ep in _torch_combine:
+            combine_config = deep_ep.Config(
+                deep_ep.Buffer.num_sms, *_torch_combine[_ep]
+            )
+            if not getattr(fused_combine_forward_func, "_e696_logged", False):
+                fused_combine_forward_func._e696_logged = True
+                print(
+                    "E-696: UAC+fusion Buffer.combine uses torch get_combine_config",
+                    flush=True,
+                )
+    # E-705 disconnected: skip_x_record_stream=True IEEE-equals E-697
+    # 12.28316879 (inert). Torch Buffer.combine has no that kw and always
+    # records x; True is not torch identity. Leave default False.
+    # E-709 disconnected: dest-rank GPU scatter of live bf16 ZipNode
+    # tokens moved paddle 12.28316879 -> 12.270207 (IEEE-equals E-706);
+    # first_bad still 1. Not torch identity. Helper unused. Live path
+    # Buffer.combine of ZipNode bf16.
+    # E-721: UAC+fusion zip token values contiguous at Buffer.combine
+    # entry. Not ZipNode.forward. Not E-718 FusionMoe after zip. Not
+    # E-719 moe_layer clone. Needle has no comma (E-690 fail-closed).
+    if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+        x = x.contiguous()
+        if not getattr(fused_combine_forward_func, "_e721_logged", False):
+            fused_combine_forward_func._e721_logged = True
+            print(
+                "E-721: UAC+fusion zip token values contiguous at Buffer.combine entry",
+                flush=True,
+            )
+        # E-724: UAC+fusion zip token values clone at Buffer.combine entry.
+        # E-721 contiguous may be a no-op view. E-719 cloned fusion_out in
+        # moe_layer not this Buffer.combine argument. Needle has no comma.
+        x = x.clone()
+        if not getattr(fused_combine_forward_func, "_e724_logged", False):
+            fused_combine_forward_func._e724_logged = True
+            print(
+                "E-724: UAC+fusion zip token values clone at Buffer.combine entry",
+                flush=True,
+            )
     combined_x, _, event = buffer.combine(
         x,
         handle=handle,
         async_finish=async_finish,
         previous_event=previous_event,
         allocate_on_comm_stream=allocate_on_comm_stream,
+        **({"config": combine_config} if combine_config is not None else {}),
     )
+    if (
+        os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
+        and event is not None
+        and getattr(event, "event", None) is not None
+    ):
+        event.current_stream_wait()
     return combined_x
 
 

@@ -61,6 +61,36 @@ SUPPORTED_ATTN_MASK = [
 ]
 
 
+# E-674: MTP concat I/O dump. Needle: [MTP-PRE-DUMP]
+_MTP_PRE_DUMPED = set()
+
+
+def _mtp_pre_bin(name, tensor, layer_idx=0):
+    dump_dir = os.environ.get("MODEL_REPRO_MTP_HANDOFF_DUMP_DIR") or os.environ.get(
+        "MODEL_REPRO_MTP_PRE_DUMP_DIR"
+    )
+    if not dump_dir or tensor is None:
+        return
+    import hashlib as _h
+    import paddle.distributed as _pd
+
+    rank = _pd.get_rank() if _pd.is_initialized() else 0
+    key = (name, int(layer_idx), int(rank))
+    if key in _MTP_PRE_DUMPED:
+        return
+    _MTP_PRE_DUMPED.add(key)
+    os.makedirs(dump_dir, exist_ok=True)
+    arr = tensor.detach().astype("float32").cpu().numpy()
+    path = os.path.join(dump_dir, f"paddle_{name}_l{layer_idx}_r{rank}.f32.bin")
+    arr.tofile(path)
+    sha = _h.sha256(arr.tobytes()).hexdigest()
+    print(
+        f"[MTP-PRE-DUMP] {path} shape={tuple(arr.shape)} "
+        f"dtype={arr.dtype} sha16={sha[:16]}",
+        flush=True,
+    )
+
+
 def _mtp_trace(name: str, tensor) -> None:
     """Cross-framework audit anchor for the MTP branch forward.
 
@@ -581,6 +611,8 @@ class MultiTokenPredictionLayer(FleetLayer):
         """
         decoder_input = self.enorm(decoder_input)
         _mtp_trace("enorm_out", decoder_input)
+        if os.environ.get("MODEL_REPRO_MTP_CONCAT_DUMP", "0") == "1":
+            _mtp_pre_bin("enorm_out", decoder_input)
 
         if self.mhc_enabled:
             # mHC mode: hidden_states is [s, b, n*h]
@@ -646,8 +678,70 @@ class MultiTokenPredictionLayer(FleetLayer):
                     hidden_states
                 )
         else:
+            _hnorm_x = hidden_states
             hidden_states = self.hnorm(hidden_states)
             _mtp_trace("hnorm_out", hidden_states)
+            if os.environ.get("MODEL_REPRO_MTP_CONCAT_DUMP", "0") == "1":
+                _mtp_pre_bin("hnorm_in", _hnorm_x)
+                _mtp_pre_bin("hnorm_out", hidden_states)
+            # E-633 dump-off: last-stage seq=18 MTP hnorm X/Y/W/dY. Observation only.
+            if os.environ.get("MODEL_REPRO_FLN_BIN_DIR"):
+                import json
+
+                import paddle.distributed as dist
+
+                _bin = os.environ["MODEL_REPRO_FLN_BIN_DIR"]
+                _rank = dist.get_rank() if dist.is_initialized() else 0
+                _seq = int(_hnorm_x.shape[0]) if getattr(_hnorm_x, "ndim", 0) >= 2 else 0
+                if int(_rank) in (2, 3) and _seq in (18, 36):
+                    os.makedirs(_bin, exist_ok=True)
+                    if not hasattr(self, "_e633_hnorm_calls"):
+                        self._e633_hnorm_calls = {}
+                    _key = f"hnorm|0|1|{_rank}"
+                    self._e633_hnorm_calls[_key] = self._e633_hnorm_calls.get(_key, 0) + 1
+                    _call = self._e633_hnorm_calls[_key]
+
+                    def _e633_hwrite(stem, t, kind, *, _dump=_bin, _rank=_rank, _call=_call):
+                        arr = t.detach().contiguous()
+                        u16 = arr.view(dtype="uint16").cpu().numpy()
+                        u16.tofile(os.path.join(_dump, f"{stem}.u16.bin"))
+                        meta = {
+                            "framework": "paddle",
+                            "kind": kind,
+                            "tag": "hnorm",
+                            "rank": int(_rank),
+                            "layer": 0,
+                            "mtp": 1,
+                            "call": int(_call),
+                            "shape": list(arr.shape),
+                            "dtype": str(arr.dtype),
+                            "suffix": "u16",
+                        }
+                        with open(os.path.join(_dump, f"{stem}.json"), "w", encoding="utf-8") as handle:
+                            json.dump(meta, handle, sort_keys=True)
+                            handle.write("\n")
+
+                    _stem = f"paddle_hnorm_r{_rank}_c{_call}_L0"
+                    _e633_hwrite(f"{_stem}_x", _hnorm_x, "x")
+                    _e633_hwrite(f"{_stem}_y", hidden_states, "y")
+                    _w = getattr(self.hnorm, "weight", None)
+                    if _w is not None:
+                        _e633_hwrite(f"{_stem}_w", _w, "w")
+                    if not getattr(self, "_e633_hnorm_announced", False):
+                        print(
+                            f"[E633-HNORM-BIN] dir={_bin} rank={_rank} call={_call}",
+                            flush=True,
+                        )
+                        self._e633_hnorm_announced = True
+
+                    def _on_hnorm_dy(g, *, _stem=_stem):
+                        if g is None:
+                            return g
+                        _e633_hwrite(f"{_stem}_dy", g, "dy")
+                        return g
+
+                    if getattr(hidden_states, "stop_gradient", True) is False:
+                        hidden_states.register_hook(_on_hnorm_dy)
             # Apply mtp_hidden_inputs_mask to mask out hidden state contributions
             # at specific positions (e.g. EOS boundaries) in MTP.
             # mask shape: [B, 1, S] -> [B, S, 1] to broadcast with hidden_states [B, S, H]
@@ -713,10 +807,72 @@ class MultiTokenPredictionLayer(FleetLayer):
             # and the (i + K)-th token's embedding, and combine them with linear projection.
             hidden_states = paddle.cat((decoder_input, hidden_states), -1)
             _mtp_trace("concat_out", hidden_states)
+            _eh_x = hidden_states
             hidden_states = self.eh_proj(hidden_states)
             if isinstance(hidden_states, tuple):
                 hidden_states, _ = hidden_states
             _mtp_trace("eh_proj_out", hidden_states)
+            if os.environ.get("MODEL_REPRO_MTP_CONCAT_DUMP", "0") == "1":
+                _mtp_pre_bin("concat_out", _eh_x)
+                _mtp_pre_bin("eh_proj_out", hidden_states)
+            # E-634 dump-off: last-stage seq=18 MTP eh_proj X/Y/W/dY. Observation only.
+            if os.environ.get("MODEL_REPRO_FLN_BIN_DIR"):
+                import json
+
+                import paddle.distributed as dist
+
+                _bin = os.environ["MODEL_REPRO_FLN_BIN_DIR"]
+                _rank = dist.get_rank() if dist.is_initialized() else 0
+                _seq = int(_eh_x.shape[0]) if getattr(_eh_x, "ndim", 0) >= 2 else 0
+                if int(_rank) in (2, 3) and _seq in (18, 36):
+                    os.makedirs(_bin, exist_ok=True)
+                    if not hasattr(self, "_e634_ehproj_calls"):
+                        self._e634_ehproj_calls = {}
+                    _key = f"ehproj|0|1|{_rank}"
+                    self._e634_ehproj_calls[_key] = self._e634_ehproj_calls.get(_key, 0) + 1
+                    _call = self._e634_ehproj_calls[_key]
+
+                    def _e634_ewrite(stem, t, kind, *, _dump=_bin, _rank=_rank, _call=_call):
+                        arr = t.detach().contiguous()
+                        u16 = arr.view(dtype="uint16").cpu().numpy()
+                        u16.tofile(os.path.join(_dump, f"{stem}.u16.bin"))
+                        meta = {
+                            "framework": "paddle",
+                            "kind": kind,
+                            "tag": "ehproj",
+                            "rank": int(_rank),
+                            "layer": 0,
+                            "mtp": 1,
+                            "call": int(_call),
+                            "shape": list(arr.shape),
+                            "dtype": str(arr.dtype),
+                            "suffix": "u16",
+                        }
+                        with open(os.path.join(_dump, f"{stem}.json"), "w", encoding="utf-8") as handle:
+                            json.dump(meta, handle, sort_keys=True)
+                            handle.write("\n")
+
+                    _stem = f"paddle_ehproj_r{_rank}_c{_call}_L0"
+                    _e634_ewrite(f"{_stem}_x", _eh_x, "x")
+                    _e634_ewrite(f"{_stem}_y", hidden_states, "y")
+                    _w = getattr(self.eh_proj, "weight", None)
+                    if _w is not None:
+                        _e634_ewrite(f"{_stem}_w", _w, "w")
+                    if not getattr(self, "_e634_ehproj_announced", False):
+                        print(
+                            f"[E634-EHPROJ-BIN] dir={_bin} rank={_rank} call={_call}",
+                            flush=True,
+                        )
+                        self._e634_ehproj_announced = True
+
+                    def _on_ehproj_dy(g, *, _stem=_stem):
+                        if g is None:
+                            return g
+                        _e634_ewrite(f"{_stem}_dy", g, "dy")
+                        return g
+
+                    if getattr(hidden_states, "stop_gradient", True) is False:
+                        hidden_states.register_hook(_on_ehproj_dy)
             # For tensor parallel we need to gather the tensor across the model-parallel
             # ranks after the linear projection. This used to call
             # `all_gather_last_dim_from_tensor_parallel_region`, but that utility reduces
@@ -734,6 +890,64 @@ class MultiTokenPredictionLayer(FleetLayer):
                         hidden_states
                     )
         _mtp_trace("concat_embeddings_out", hidden_states)
+        # E-635 dump-off: last-stage seq=18 MTP transformer incoming after TP-gather+SP-scatter.
+        if os.environ.get("MODEL_REPRO_FLN_BIN_DIR"):
+            import json
+
+            import paddle.distributed as dist
+
+            _bin = os.environ["MODEL_REPRO_FLN_BIN_DIR"]
+            _rank = dist.get_rank() if dist.is_initialized() else 0
+            _seq = (
+                int(hidden_states.shape[0])
+                if getattr(hidden_states, "ndim", 0) >= 2
+                else 0
+            )
+            if int(_rank) in (2, 3) and _seq in (18, 36):
+                os.makedirs(_bin, exist_ok=True)
+                if not hasattr(self, "_e635_mtpin_calls"):
+                    self._e635_mtpin_calls = {}
+                _key = f"mtpin|0|1|{_rank}"
+                self._e635_mtpin_calls[_key] = self._e635_mtpin_calls.get(_key, 0) + 1
+                _call = self._e635_mtpin_calls[_key]
+
+                def _e635_mwrite(stem, t, kind, *, _dump=_bin, _rank=_rank, _call=_call):
+                    arr = t.detach().contiguous()
+                    u16 = arr.view(dtype="uint16").cpu().numpy()
+                    u16.tofile(os.path.join(_dump, f"{stem}.u16.bin"))
+                    meta = {
+                        "framework": "paddle",
+                        "kind": kind,
+                        "tag": "mtpin",
+                        "rank": int(_rank),
+                        "layer": 0,
+                        "mtp": 1,
+                        "call": int(_call),
+                        "shape": list(arr.shape),
+                        "dtype": str(arr.dtype),
+                        "suffix": "u16",
+                    }
+                    with open(os.path.join(_dump, f"{stem}.json"), "w", encoding="utf-8") as handle:
+                        json.dump(meta, handle, sort_keys=True)
+                        handle.write("\n")
+
+                _stem = f"paddle_mtpin_r{_rank}_c{_call}_L0"
+                _e635_mwrite(f"{_stem}_y", hidden_states, "y")
+                if not getattr(self, "_e635_mtpin_announced", False):
+                    print(
+                        f"[E635-MTPIN-BIN] dir={_bin} rank={_rank} call={_call}",
+                        flush=True,
+                    )
+                    self._e635_mtpin_announced = True
+
+                def _on_mtpin_dy(g, *, _stem=_stem):
+                    if g is None:
+                        return g
+                    _e635_mwrite(f"{_stem}_dy", g, "dy")
+                    return g
+
+                if getattr(hidden_states, "stop_gradient", True) is False:
+                    hidden_states.register_hook(_on_mtpin_dy)
         return hidden_states
 
     def _proj_and_transformer_layer(
@@ -767,6 +981,8 @@ class MultiTokenPredictionLayer(FleetLayer):
 
         _mtp_trace("mtp_trunk_hidden_in", hidden_states)
         _mtp_trace("mtp_decoder_input", decoder_input)
+        _mtp_pre_bin("mtp_trunk_hidden_in", hidden_states)
+        _mtp_pre_bin("mtp_decoder_input", decoder_input)
 
         with rng_context:
             hidden_states = self._concat_embeddings(
@@ -816,6 +1032,9 @@ class MultiTokenPredictionLayer(FleetLayer):
 
         hidden_states = rst_dict["hidden_states"]
         _mtp_trace("transformer_layer_out", hidden_states)
+        if os.environ.get("MODEL_REPRO_MTP_CONCAT_DUMP", "0") == "1":
+            _mtp_pre_bin("transformer_layer_in", input_dict["hidden_states"])
+            _mtp_pre_bin("transformer_layer_out", hidden_states)
 
         # In mHC mode, skip postprocess here - it's deferred to forward()
         # so we can keep multi-stream state for subsequent MTP layers.

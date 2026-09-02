@@ -277,10 +277,104 @@ class WrappedPaddleNormPipe(paddle.nn.Layer):
                 hidden_states_concat, self.config.num_nextn_predict_layers + 1
             )
             dict_args["hidden_states"] = tensor_list[0]
+        _fln_x = dict_args["hidden_states"]
         rst = {
             **dict_args,
             "hidden_states": self.norm(dict_args["hidden_states"]),
         }
+        # E-676: last-decoder residual vs final LN vs MTP trunk. Needle: [MTP-HANDOFF-DUMP]
+        _handoff = os.environ.get("MODEL_REPRO_MTP_HANDOFF_DUMP_DIR")
+        if _handoff:
+            import hashlib as _h
+            import paddle.distributed as _pd
+
+            _rank = _pd.get_rank() if _pd.is_initialized() else 0
+            os.makedirs(_handoff, exist_ok=True)
+            for _name, _t in (
+                ("fln_in", _fln_x),
+                ("fln_out", rst["hidden_states"]),
+            ):
+                _key = (_name, int(_rank))
+                if not hasattr(self, "_e676_dumped"):
+                    self._e676_dumped = set()
+                if _key in self._e676_dumped:
+                    continue
+                self._e676_dumped.add(_key)
+                _arr = _t.detach().astype("float32").cpu().numpy()
+                _path = os.path.join(_handoff, f"paddle_{_name}_r{_rank}.f32.bin")
+                _arr.tofile(_path)
+                print(
+                    f"[MTP-HANDOFF-DUMP] {_path} shape={tuple(_arr.shape)} "
+                    f"dtype={_arr.dtype} sha16={_h.sha256(_arr.tobytes()).hexdigest()[:16]}",
+                    flush=True,
+                )
+        # E-632 dump-off: last-stage call-9 final_ln X/Y/W + incoming dX at seq=18.
+        # Observation only. Do not set QA_XY (dump-on observer-shifts IEEE).
+        if os.environ.get("MODEL_REPRO_FLN_BIN_DIR"):
+            import json
+
+            import paddle.distributed as dist
+
+            _bin = os.environ["MODEL_REPRO_FLN_BIN_DIR"]
+            _rank = dist.get_rank() if dist.is_initialized() else 0
+            _key = f"flnbin|-1|0|{_rank}"
+            if not hasattr(self, "_e632_fln_calls"):
+                self._e632_fln_calls = {}
+            self._e632_fln_calls[_key] = self._e632_fln_calls.get(_key, 0) + 1
+            _call = self._e632_fln_calls[_key]
+            _seq = int(_fln_x.shape[0]) if getattr(_fln_x, "ndim", 0) >= 2 else 0
+            if int(_rank) in (2, 3) and _seq == 18:
+                os.makedirs(_bin, exist_ok=True)
+
+                def _e632_write(stem, t, kind, *, _dump=_bin, _rank=_rank, _call=_call):
+                    arr = t.detach().contiguous()
+                    u16 = arr.view(dtype="uint16").cpu().numpy()
+                    u16.tofile(os.path.join(_dump, f"{stem}.u16.bin"))
+                    meta = {
+                        "framework": "paddle",
+                        "kind": kind,
+                        "tag": "fln",
+                        "rank": int(_rank),
+                        "layer": -1,
+                        "mtp": 0,
+                        "call": int(_call),
+                        "shape": list(arr.shape),
+                        "dtype": str(arr.dtype),
+                        "suffix": "u16",
+                    }
+                    with open(os.path.join(_dump, f"{stem}.json"), "w", encoding="utf-8") as handle:
+                        json.dump(meta, handle, sort_keys=True)
+                        handle.write("\n")
+
+                _stem = f"paddle_fln_r{_rank}_c{_call}_L-1"
+                _w = getattr(self.norm, "weight", None)
+                _e632_write(f"{_stem}_x", _fln_x, "x")
+                _e632_write(f"{_stem}_y", rst["hidden_states"], "y")
+                if _w is not None:
+                    _e632_write(f"{_stem}_w", _w, "w")
+                if not getattr(self, "_e632_fln_announced", False):
+                    print(
+                        f"[E632-FLNDX-BIN] dir={_bin} rank={_rank} call={_call}",
+                        flush=True,
+                    )
+                    self._e632_fln_announced = True
+
+                def _on_fln_bin_dy(g, *, _stem=_stem):
+                    if g is None:
+                        return g
+                    _e632_write(f"{_stem}_dy", g, "dy")
+                    return g
+
+                def _on_fln_bin_dx(g, *, _stem=_stem):
+                    if g is None:
+                        return g
+                    _e632_write(f"{_stem}_dx", g, "dx")
+                    return g
+
+                if getattr(rst["hidden_states"], "stop_gradient", True) is False:
+                    rst["hidden_states"].register_hook(_on_fln_bin_dy)
+                if getattr(_fln_x, "stop_gradient", True) is False:
+                    _fln_x.register_hook(_on_fln_bin_dx)
         if (
             self.config.num_nextn_predict_layers is not None
             and self.config.num_nextn_predict_layers > 0

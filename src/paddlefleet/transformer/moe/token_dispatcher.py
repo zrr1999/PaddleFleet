@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
@@ -639,6 +640,10 @@ class _DeepEPManager(_DispatchManager):
         use_ue8m0: bool = False,
         using_sonic_moe: bool = False,
     ) -> paddle.Tensor:
+        # E-734 disconnected: forcing async_finish=True on DeepEP
+        # dispatch fail-closed paddle LossNan (exit 1). Torch control
+        # stayed E-668 12.02612686. Not a 0diff closer. Restore default
+        # async_finish=False. Needle left in comments only.
         hidden_states, dispatched_probs, states, scale = fused_dispatch(
             hidden_states,
             self.token_indices,
@@ -655,6 +660,17 @@ class _DeepEPManager(_DispatchManager):
         self.tokens_per_expert = states["tokens_per_expert"]
         self.dispatched_indices = states["dispatched_indices"]
         self.dispatched_probs = dispatched_probs
+        # E-735: UAC+fusion zip token values clone at DeepEPManager.dispatch
+        # return. Not fused_combine_forward_func. Not E-734 dispatch
+        # async_finish. Not E-715-E-733 zip wraps. Needle has no comma.
+        if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+            hidden_states = hidden_states.clone()
+            if not getattr(self, "_e735_dispatch_return_clone_logged", False):
+                self._e735_dispatch_return_clone_logged = True
+                print(
+                    "E-735: UAC+fusion zip token values clone at DeepEPManager.dispatch return",
+                    flush=True,
+                )
 
         return hidden_states, scale
 
@@ -721,6 +737,28 @@ class _DeepEPManager(_DispatchManager):
             assert combine_grad_handle is not None, (
                 "fp8_dispatch=True, but combine_grad_handle is None."
             )
+        # E-694: UAC+fusion DeepEP combine skips moe_ep_barrier like torch token_combine.
+        # Torch FusedCombine.forward has no EP barrier before Buffer.combine.
+        # Needle has no comma (E-690 fail-closed).
+        combine_barrier = self.moe_ep_barrier
+        if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+            combine_barrier = False
+            if not getattr(self, "_e694_combine_logged", False):
+                self._e694_combine_logged = True
+                print(
+                    "E-694: UAC+fusion DeepEP combine skips moe_ep_barrier like torch token_combine",
+                    flush=True,
+                )
+            # E-727: UAC+fusion zip token values clone at DeepEPManager.combine
+            # before fused_combine. Not fused_combine_forward_func. Not
+            # MoELayer.combine. Not ZipNode.forward. Needle has no comma.
+            hidden_states = hidden_states.clone()
+            if not getattr(self, "_e727_deepep_combine_clone_logged", False):
+                self._e727_deepep_combine_clone_logged = True
+                print(
+                    "E-727: UAC+fusion zip token values clone at DeepEPManager.combine before fused_combine",
+                    flush=True,
+                )
         hidden_states = fused_combine(
             hidden_states,
             self.group,
@@ -728,11 +766,22 @@ class _DeepEPManager(_DispatchManager):
             _rr_fusedcombined=self._rr_fusedcombined,
             combine_overlap_handle=combine_overlap_handle,
             async_finish=async_finish,
-            moe_ep_barrier=self.moe_ep_barrier,
+            moe_ep_barrier=combine_barrier,
             use_rr_deepep_combine=use_rr_deepep_combine,
             fp8_dispatch=fp8_dispatch,
             combine_grad_handle=combine_grad_handle,
         )
+        # E-737: UAC+fusion zip token values clone at DeepEPManager.combine
+        # return after fused_combine. Not fused_combine_forward_func. Not
+        # E-727 combine-entry clone. Not E-715-E-735. Needle has no comma.
+        if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+            hidden_states = hidden_states.clone()
+            if not getattr(self, "_e737_combine_return_clone_logged", False):
+                self._e737_combine_return_clone_logged = True
+                print(
+                    "E-737: UAC+fusion zip token values clone at DeepEPManager.combine return after fused_combine",
+                    flush=True,
+                )
         # Release the handle and token_indices after combine operation
         self.handle = None
         self.token_indices = None
@@ -946,6 +995,18 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             )
         )
         tokens_per_expert = self._comm_manager.get_number_of_tokens_per_expert()
+        # E-741: UAC+fusion zip token values clone at Flex dispatch_postprocess
+        # return (expert GEMM input after DeepEP permute). Not
+        # fused_combine_forward_func. Not E-735 dispatch-return clone.
+        # Not E-737 combine-return. Not E-715-E-736. Needle has no comma.
+        if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+            global_input_tokens = global_input_tokens.clone()
+            if not getattr(self, "_e741_flex_post_clone_logged", False):
+                self._e741_flex_post_clone_logged = True
+                print(
+                    "E-741: UAC+fusion zip token values clone at Flex dispatch_postprocess return",
+                    flush=True,
+                )
 
         return global_input_tokens, tokens_per_expert
 

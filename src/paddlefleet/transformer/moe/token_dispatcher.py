@@ -664,6 +664,20 @@ class _DeepEPManager(_DispatchManager):
         # paddle CastGrad (exit 241) after the needle fired. Torch
         # control stayed E-668 12.02612686. Not a 0diff closer. Restore
         # original tensors. Needle left in comments only.
+        # E-751: UAC+fusion DeepEP dispatch skips moe_ep_barrier like
+        # torch FusedDispatch. Torch fused_a2a.FusedDispatch.forward has
+        # no EP barrier before Buffer.get_dispatch_layout / dispatch.
+        # E-694 skipped the barrier on fused_combine only. Needle has
+        # no comma (E-690 fail-closed).
+        dispatch_barrier = self.moe_ep_barrier
+        if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+            dispatch_barrier = False
+            if not getattr(self, "_e751_dispatch_logged", False):
+                self._e751_dispatch_logged = True
+                print(
+                    "E-751: UAC+fusion DeepEP dispatch skips moe_ep_barrier like torch FusedDispatch",
+                    flush=True,
+                )
         hidden_states, dispatched_probs, states, scale = fused_dispatch(
             hidden_states,
             self.token_indices,
@@ -672,7 +686,7 @@ class _DeepEPManager(_DispatchManager):
             self.group,
             fp8_dispatch=fp8_dispatch,
             async_finish=async_finish,
-            moe_ep_barrier=self.moe_ep_barrier,
+            moe_ep_barrier=dispatch_barrier,
             use_ue8m0=use_ue8m0,
             using_sonic_moe=using_sonic_moe,
         )

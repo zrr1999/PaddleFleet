@@ -458,6 +458,22 @@ def fused_dispatch_forward_func(
                     "E-697: UAC+fusion Buffer.dispatch uses torch get_dispatch_config",
                     flush=True,
                 )
+    # E-754: UAC+fusion Buffer.dispatch waits on get_dispatch_layout event
+    # like torch FusedDispatch. Torch fused_a2a.FusedDispatch.forward
+    # passes previous_event=event from get_dispatch_layout into
+    # buffer.dispatch. Paddle default reuses the caller previous_event
+    # and drops previous_event_. Do not force async_finish (E-734
+    # LossNan). Do not set allocate_on_comm_stream (E-752 assert).
+    # Needle has no comma (E-690 fail-closed).
+    dispatch_previous_event = previous_event
+    if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+        dispatch_previous_event = previous_event_
+        if not getattr(fused_dispatch_forward_func, "_e754_logged", False):
+            fused_dispatch_forward_func._e754_logged = True
+            print(
+                "E-754: UAC+fusion Buffer.dispatch waits on get_dispatch_layout event like torch FusedDispatch",
+                flush=True,
+            )
     (
         recv_x,
         recv_token_indices,
@@ -473,7 +489,7 @@ def fused_dispatch_forward_func(
         num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
         is_token_in_rank=is_token_in_rank,
         num_tokens_per_expert=num_tokens_per_expert,
-        previous_event=previous_event,
+        previous_event=dispatch_previous_event,
         async_finish=async_finish,
         allocate_on_comm_stream=allocate_on_comm_stream,
         **dispatch_kwargs,

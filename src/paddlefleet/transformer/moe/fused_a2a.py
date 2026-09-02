@@ -523,7 +523,26 @@ def fused_dispatch_forward_func(
 
     states = {}
     states["dispatched_indices"] = recv_token_indices
-    states["tokens_per_expert"] = num_recv_tokens_per_expert_list
+    # E-761: UAC+fusion decoder DeepEP tokens_per_expert list
+    # materialized as int64 tensor at fused_dispatch exit. DeepEP
+    # returns a Python list; FusionMoe unzip/GEMM iterates that
+    # count. Not expert_alignment (E-760). Not unzip int64 (E-759).
+    # Not after-event wait. Not FusionMoe-entry contiguous. Not
+    # dispatch-out sort. Not layout-event. Not hidden reshape. Not
+    # skip-barrier. Not async-alloc. Not fused_dispatch-entry
+    # routing. Not fused_combine wrap. Needle has no comma
+    # (E-690 fail-closed).
+    tpe = num_recv_tokens_per_expert_list
+    if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+        if tpe is not None and isinstance(tpe, (list, tuple)):
+            tpe = paddle.to_tensor(tpe, dtype="int64")
+        if not getattr(fused_dispatch_forward_func, "_e761_logged", False):
+            fused_dispatch_forward_func._e761_logged = True
+            print(
+                "E-761: UAC+fusion decoder DeepEP tokens_per_expert list materialized as int64 tensor at fused_dispatch exit",
+                flush=True,
+            )
+    states["tokens_per_expert"] = tpe
     states["handle"] = handle
 
     return recv_x, recv_token_probs, states, event

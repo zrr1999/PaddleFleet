@@ -494,6 +494,24 @@ def fused_dispatch_forward_func(
         allocate_on_comm_stream=allocate_on_comm_stream,
         **dispatch_kwargs,
     )
+    # E-758: UAC+fusion Buffer.dispatch after-event current_stream_wait
+    # like torch FusedDispatch. Torch fused_a2a.FusedDispatch.forward
+    # waits on after_event_overlap after buffer.dispatch when
+    # async_finish. Paddle live dispatch keeps async_finish=False
+    # (E-734 LossNan) and allocate_on_comm_stream=False (E-752 assert)
+    # so the after-event is otherwise unused. E-754 only fed the
+    # layout previous_event into dispatch. E-695 waits combine only.
+    # Do not wrap fused_combine_forward_func. Needle has no comma
+    # (E-690 fail-closed).
+    if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+        if event is not None and getattr(event, "current_stream_wait", None):
+            event.current_stream_wait()
+            if not getattr(fused_dispatch_forward_func, "_e758_logged", False):
+                fused_dispatch_forward_func._e758_logged = True
+                print(
+                    "E-758: UAC+fusion Buffer.dispatch after-event current_stream_wait like torch FusedDispatch",
+                    flush=True,
+                )
 
     states = {}
     states["dispatched_indices"] = recv_token_indices

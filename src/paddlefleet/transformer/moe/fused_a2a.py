@@ -951,6 +951,26 @@ class DeepEPDispatch(PyLayer):
                     x_fp8, scale, use_ue8m0=use_ue8m0
                 )
             x = (x_fp8, scale)
+        # E-763: UAC+fusion decoder DeepEP hidden clone at
+        # DeepEPDispatch.forward before fused_dispatch_forward_func.
+        # Different injection point from fused_dispatch apply (E-762
+        # routing contiguous) and DeepEPManager.dispatch return
+        # (E-735 clone). Live dump-off is bf16 so x is a tensor not
+        # an FP8 pair. Not tpe-list int64. Not expert_alignment. Not
+        # unzip int64. Not after-event wait. Not FusionMoe-entry
+        # contiguous. Not dispatch-out sort. Not layout-event. Not
+        # hidden reshape. Not skip-barrier. Not async-alloc. Not
+        # fused_dispatch-entry routing. Not fused_combine wrap.
+        # Needle has no comma (E-690 fail-closed).
+        if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+            if not isinstance(x, tuple):
+                x = x.clone()
+            if not getattr(DeepEPDispatch, "_e763_logged", False):
+                DeepEPDispatch._e763_logged = True
+                print(
+                    "E-763: UAC+fusion decoder DeepEP hidden clone at DeepEPDispatch.forward before fused_dispatch_forward_func",
+                    flush=True,
+                )
         recv_x, recv_token_probs, states, event = fused_dispatch_forward_func(
             x,
             token_indices,

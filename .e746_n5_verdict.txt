@@ -1,0 +1,1 @@
+E-746 N=5 dump-off unique ckpt_e746p2e2_* decoder sparse-map topk inert vs E-697. IEEE 0/5 first_bad=1. Did not burn N=100.

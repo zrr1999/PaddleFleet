@@ -1150,6 +1150,30 @@ class MoELayer(nn.Layer):
                     fp8_combine_grad_handle=fp8_combine_grad_handle,
                 )
             else:
+                # E-756: UAC+fusion decoder DeepEP dispatched hidden
+                # contiguous at FusionMoePyLayer entry. E-673 decoder
+                # dispatched_hs exact; FusionMoe unzip gathers that
+                # buffer. E-753 contiguous-d the pre-dispatch view.
+                # E-735 clones dispatch return. This injector is the
+                # FusionMoe operand not the dispatcher return. Not
+                # routing mutate. Not skip-barrier. Not async_finish.
+                # Not allocate_on_comm_stream. Not layout-event. Not
+                # dispatch-out sort. Not fused_combine wrap. Needle
+                # has no comma (E-690 fail-closed).
+                if os.environ.get(
+                    "FLAGS_use_accuracy_compatible_kernel", "0"
+                ) == "1":
+                    dispatched_hidden_states = (
+                        dispatched_hidden_states.contiguous()
+                    )
+                    if not getattr(
+                        self, "_e756_fusion_entry_hs_logged", False
+                    ):
+                        self._e756_fusion_entry_hs_logged = True
+                        print(
+                            "E-756: UAC+fusion decoder DeepEP dispatched hidden contiguous at FusionMoePyLayer entry",
+                            flush=True,
+                        )
                 hidden_states = FusionMoePyLayer.apply(
                     dispatched_hidden_states,
                     dispatched_probs,

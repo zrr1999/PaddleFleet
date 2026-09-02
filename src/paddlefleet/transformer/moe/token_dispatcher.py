@@ -659,24 +659,11 @@ class _DeepEPManager(_DispatchManager):
         # after the needle fired. Torch control stayed E-668
         # 12.02612686. Not a 0diff closer. Restore unsorted columns.
         # Needle left in comments only.
-        # E-750: decoder live DeepEP routing tensors materialized as
-        # int64 contiguous indices and contiguous float32 probs before
-        # fused_dispatch. Not column permutation (E-747/E-748/E-749).
-        # Not E-746 sparse-map topk. Not fused_combine. Not MTP. Not
-        # alltoall. Needle has no comma (E-690 fail-closed).
-        if (
-            os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
-            and self.token_indices is not None
-            and self.token_probs is not None
-        ):
-            self.token_indices = self.token_indices.cast("int64").contiguous()
-            self.token_probs = self.token_probs.cast("float32").contiguous()
-            if not getattr(self, "_e750_decoder_routing_materialize_logged", False):
-                self._e750_decoder_routing_materialize_logged = True
-                print(
-                    "E-750: UAC+fusion decoder DeepEP operands materialize routing indices as int64 contiguous and probs contiguous",
-                    flush=True,
-                )
+        # E-750 disconnected: materializing decoder DeepEP routing
+        # tensors as int64 contiguous + float32 contiguous segfaulted
+        # paddle CastGrad (exit 241) after the needle fired. Torch
+        # control stayed E-668 12.02612686. Not a 0diff closer. Restore
+        # original tensors. Needle left in comments only.
         hidden_states, dispatched_probs, states, scale = fused_dispatch(
             hidden_states,
             self.token_indices,

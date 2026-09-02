@@ -1,0 +1,1 @@
+E-750 N=5 dump-off unique ckpt_e750p2e2_* decoder routing materialize int64 contiguous + probs contiguous fail-closed: paddle CastGrad segfault exit 241 after needle. Torch IEEE-equal E-668. Injector disconnected. n100_allowed=false.

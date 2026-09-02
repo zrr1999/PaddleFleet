@@ -1508,7 +1508,28 @@ class MlpNode:
         num_experts = len(self.tokens_per_expert)
 
         # 1. unzip: 按专家分组 + pad 到 FP8_ALIGN 对齐
-        self.dispatched_indices = dispatched_indices.to(paddle.int32)
+        # E-759: UAC+fusion decoder DeepEP dispatched_indices stay
+        # int64 into unzip. Default FusionMoe unzip casts to int32
+        # at this FusionMoePyLayer operand. E-750 materialize-d
+        # int64 contiguous at fused_dispatch entry and fail-closed
+        # CastGrad. E-757 contiguous-d the same tensor at
+        # FusionMoePyLayer.apply without changing dtype. This
+        # injector is unzip-entry dtype not FusionMoe-entry
+        # contiguous, not dispatch-out sort, not layout-event,
+        # not hidden reshape, not skip-barrier, not async-alloc,
+        # not fused_dispatch-entry routing, not after-event wait,
+        # not fused_combine wrap. Needle has no comma
+        # (E-690 fail-closed).
+        if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+            self.dispatched_indices = dispatched_indices
+            if not getattr(self, "_e759_unzip_idx_i64_logged", False):
+                self._e759_unzip_idx_i64_logged = True
+                print(
+                    "E-759: UAC+fusion decoder DeepEP dispatched_indices stay int64 into unzip",
+                    flush=True,
+                )
+        else:
+            self.dispatched_indices = dispatched_indices.to(paddle.int32)
         (
             unzipped_tokens,
             zipped_expertwise_rowmap,

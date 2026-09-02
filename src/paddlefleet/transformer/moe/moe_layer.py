@@ -1174,6 +1174,28 @@ class MoELayer(nn.Layer):
                             "E-756: UAC+fusion decoder DeepEP dispatched hidden contiguous at FusionMoePyLayer entry",
                             flush=True,
                         )
+                    # E-757: UAC+fusion decoder DeepEP dispatched probs
+                    # and indices contiguous at FusionMoePyLayer entry.
+                    # E-756 already contiguous-d hidden. E-755 sorted
+                    # columns after fused_dispatch. This injector is
+                    # the remaining FusionMoe routing operands not the
+                    # hidden buffer. Not fused_dispatch-entry routing
+                    # mutate. Not layout-event. Not hidden reshape.
+                    # Not skip-barrier. Not async_finish. Not
+                    # allocate_on_comm_stream. Not fused_combine wrap.
+                    # Needle has no comma (E-690 fail-closed).
+                    if dispatched_probs is not None:
+                        dispatched_probs = dispatched_probs.contiguous()
+                    if dispatched_indices is not None:
+                        dispatched_indices = dispatched_indices.contiguous()
+                    if not getattr(
+                        self, "_e757_fusion_entry_pi_logged", False
+                    ):
+                        self._e757_fusion_entry_pi_logged = True
+                        print(
+                            "E-757: UAC+fusion decoder DeepEP dispatched probs and indices contiguous at FusionMoePyLayer entry",
+                            flush=True,
+                        )
                 hidden_states = FusionMoePyLayer.apply(
                     dispatched_hidden_states,
                     dispatched_probs,

@@ -1264,6 +1264,29 @@ if HAVE_DEEP_EP:
         Returns:
             Result of DeepEPDispatch
         """
+        # E-762: UAC+fusion decoder DeepEP routing operands
+        # contiguous at fused_dispatch apply. Torch FusedDispatch.apply
+        # already contiguous-s x only. Paddle default also contiguous-s
+        # x only and passes token_indices/token_probs as-is. E-753
+        # contiguous-d hidden at preprocess. E-757 contiguous-d
+        # dispatched routing at FusionMoePyLayer.apply after dispatch.
+        # E-750 materialize-d int64 contiguous at fused_dispatch entry
+        # and fail-closed CastGrad. This injector is layout-only at
+        # the apply site, not dtype, not tpe-list, not
+        # expert_alignment, not unzip int64, not after-event wait,
+        # not fused_dispatch-entry routing permute. Needle has no
+        # comma (E-690 fail-closed).
+        if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+            if token_indices is not None:
+                token_indices = token_indices.contiguous()
+            if token_probs is not None:
+                token_probs = token_probs.contiguous()
+            if not getattr(fused_dispatch, "_e762_logged", False):
+                fused_dispatch._e762_logged = True
+                print(
+                    "E-762: UAC+fusion decoder DeepEP routing operands contiguous at fused_dispatch apply",
+                    flush=True,
+                )
         return DeepEPDispatch.apply(
             x.contiguous(),
             token_indices,

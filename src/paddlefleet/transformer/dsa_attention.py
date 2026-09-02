@@ -58,6 +58,100 @@ try:
 except (ImportError, RuntimeError):
     _fast_hadamard_transform = None
 
+import os
+
+_ACCURACY_COMPATIBLE_KERNEL: bool = (
+    os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
+)
+
+
+class _SteQKMatmul(paddle.autograd.PyLayer):
+    """Opaque 4D QK STE matmul so live PIR cannot rewrite dK to bf16 GEMM.
+
+    E-335/E-336: q/k/P/dP 0diff vs isolated, but live STE is bf16-padded and
+    != isolated fp32 STE. Isolated FakeGather+_unfused uses this same
+    paddle.matmul and is 0/30720 vs torch gathdy. Nested autograd inside
+    PyLayer segfaulted (E-337); backward is the broadcast matmul dK
+    (dK = scale * sum_h (dS_h.T @ Q_h)), computed in fp32. Not a new DSA
+    formula. _KeepFp32 GEMM-ones on k4 was CSE'd live (E-336).
+    """
+
+    @staticmethod
+    def forward(ctx, q4: Tensor, k4: Tensor, scale: Tensor) -> Tensor:
+        q = q4.cast("float32") if q4.dtype != paddle.float32 else q4
+        k = k4.cast("float32") if k4.dtype != paddle.float32 else k4
+        ctx.save_for_backward(q, k, scale)
+        ctx.k_dtype = k4.dtype
+        ctx.k_heads = int(k.shape[1])
+        return paddle.matmul(q, k.transpose([0, 1, 3, 2])) * scale
+
+    @staticmethod
+    def backward(ctx, grad_scores: Tensor):
+        q, k, scale = ctx.saved_tensor()
+        g = (
+            grad_scores.cast("float32")
+            if grad_scores.dtype != paddle.float32
+            else grad_scores
+        )
+        # scores[b,h,i,j] = scale * q[b,h,i,d] @ k[b,0,j,d]
+        # dK[b,0,j,d] = scale * sum_h (dS[b,h].T @ q[b,h])
+        gk = paddle.matmul(g.transpose([0, 1, 3, 2]), q) * scale
+        if ctx.k_heads == 1 and int(gk.shape[1]) != 1:
+            gk = gk.sum(axis=1, keepdim=True)
+        if gk.dtype != ctx.k_dtype:
+            gk = gk.cast(ctx.k_dtype)
+        return None, gk, None
+
+
+class _AccuracyCompatibleSoftmax(paddle.autograd.PyLayer):
+    """Masked softmax with torch-aligned explicit backward. See repos copy."""
+
+    @staticmethod
+    def forward(ctx, logits: Tensor) -> Tensor:
+        attn_weights = paddle.exp(
+            logits - paddle.max(logits, axis=-1, keepdim=True)
+        )
+        invalid = logits == float("-inf")
+        zeros = paddle.zeros([], dtype=attn_weights.dtype)
+        attn_weights = paddle.where(invalid, zeros, attn_weights)
+        denom = attn_weights.sum(axis=-1, keepdim=True).clip(min=1e-10)
+        attn_weights = attn_weights / denom
+        attn_weights = paddle.where(invalid, zeros, attn_weights)
+        ctx.save_for_backward(attn_weights, invalid)
+        return attn_weights
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        probabilities, invalid = ctx.saved_tensor()
+        sum_grad = (grad_output * probabilities).sum(axis=-1, keepdim=True)
+        grad_logits = probabilities * (grad_output - sum_grad)
+        return paddle.where(
+            invalid, paddle.zeros([], dtype=grad_logits.dtype), grad_logits
+        )
+
+
+def _absorb_q_nope_k_up(qn3, k_abs_weight):
+    """K-absorb q_nope @ k_up. Torch-aligned UAC path uses bmm, not einsum."""
+    uac = os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
+    if uac:
+        return paddle.bmm(qn3, k_abs_weight)
+    return paddle.einsum(
+        "hsk,hkd->hsd", qn3.cast("float32"), k_abs_weight.cast("float32")
+    ).cast(qn3.dtype)
+
+
+def _accuracy_compat_linear(projection, x):
+    """Torch-aligned strided-transpose GEMM (same formulation as the MLA path).
+
+    E-062 repro candidate: the DSA indexer projections are duplicated (TP1)
+    linears; routing them through paddle.nn.functional.linear makes their
+    kernels bit-identical to torch's eager F.linear path.
+    """
+    bias = projection.bias if not projection.skip_bias_add else None
+    output_bias = projection.bias if projection.skip_bias_add else None
+    output = F.linear(x, projection.weight, bias)
+    return output, output_bias
+
 if TYPE_CHECKING:
     from paddlefleet.packed_seq_params import PackedSeqParams
     from paddlefleet.transformer.transformer_config import TransformerConfig
@@ -173,17 +267,50 @@ def _unfused_dsa_attention(
     """
     b, s, nhpp, qk_hd = query.shape
     v_hd = value.shape[-1]
+    uac_mqa = (
+        os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
+        and key.dim() == 4
+        and key.shape[2] == 1
+        and nhpp > 1
+        and key.shape[-1] >= v_hd
+    )
+    key_mqa = key
 
     # Reshape for bmm: [b*nhpp, s, hd]
     q = query.transpose([0, 2, 1, 3]).reshape([b * nhpp, s, qk_hd])
-    k = key.transpose([0, 2, 1, 3]).reshape([b * nhpp, s, qk_hd])
-    v = value.transpose([0, 2, 1, 3]).reshape([b * nhpp, s, v_hd])
+    if key.dim() == 4 and key.shape[2] == 1 and nhpp > 1:
+        # MQA key broadcast to the query head count (absorbed core path).
+        key_e = key.expand([b, s, nhpp, qk_hd])
+        if uac_mqa:
+            key_e = key_e.detach()
+        k = key_e.transpose([0, 2, 1, 3]).reshape([b * nhpp, s, qk_hd])
+    else:
+        k = key.transpose([0, 2, 1, 3]).reshape([b * nhpp, s, qk_hd])
+    if uac_mqa:
+        # Mul-1 after slice: clone/contiguous were PIR-folded on live.
+        # V is the leading slice of absorbed key, matching torch key[..., :v].
+        value = paddle.slice(key, axes=[-1], starts=[0], ends=[v_hd]) * 1
+    if value.dim() == 4 and value.shape[2] == 1 and nhpp > 1:
+        value_e = value.expand([b, s, nhpp, v_hd])
+        v = value_e.transpose([0, 2, 1, 3]).reshape([b * nhpp, s, v_hd])
+    else:
+        v = value.transpose([0, 2, 1, 3]).reshape([b * nhpp, s, v_hd])
 
     # Q * K^T with scale: [b*nhpp, s, s]
     attn_scores = (
         paddle.bmm(q.cast("float32"), k.cast("float32").transpose([0, 2, 1]))
         * softmax_scale
     )
+    k4 = None
+    if uac_mqa:
+        q4 = query.transpose([0, 2, 1, 3]).cast("float32").detach()
+        k4 = key_mqa.transpose([0, 2, 1, 3]).cast("float32")
+        # E-336: _KeepFp32 on k4 was CSE'd live. Opaque matmul so PIR
+        # cannot rewrite 4D STE dK to bf16 (live STE lower-16 was 0).
+        scale_t = paddle.full([], softmax_scale, dtype="float32")
+        scores_bwd = _SteQKMatmul.apply(q4, k4, scale_t)
+        scores_bwd = scores_bwd.reshape([b * nhpp, s, s])
+        attn_scores = attn_scores + (scores_bwd - scores_bwd.detach())
 
     # Apply combined mask (causal + sparse index mask)
     if combined_mask is not None:
@@ -194,7 +321,10 @@ def _unfused_dsa_attention(
         )
         attn_scores = attn_scores + mask.cast("float32")
 
-    attn_weights = F.softmax(attn_scores, axis=-1)
+    if _ACCURACY_COMPATIBLE_KERNEL:
+        attn_weights = _AccuracyCompatibleSoftmax.apply(attn_scores)
+    else:
+        attn_weights = F.softmax(attn_scores, axis=-1)
 
     # Attention_weights * V: [b*nhpp, s, v_hd]
     output = paddle.bmm(attn_weights.cast(v.dtype), v)
@@ -552,11 +682,19 @@ class DSAIndexer(paddle.nn.Layer):
             else freqs
         )
 
-        q, _ = self.wq_b(q_latent)  # [b, s, n_heads * head_dim]
+        if _ACCURACY_COMPATIBLE_KERNEL:
+            # E-062 repro candidate: torch-aligned F.linear for the DSA indexer
+            # projections (wq_b / wk / weights_proj), mirroring the q_a_proj acc
+            # path. Inputs are already sequence-gathered above; the modules are
+            # duplicated (TP1) so F.linear keeps identical semantics.
+            q, _ = _accuracy_compat_linear(self.wq_b, q_latent)
+            k, _ = _accuracy_compat_linear(self.wk, hidden_states)
+        else:
+            q, _ = self.wq_b(q_latent)  # [b, s, n_heads * head_dim]
+            k, _ = self.wk(hidden_states)  # [b, s, head_dim]
         q = q.reshape([bsz, seqlen, self.n_heads, self.head_dim])
         q = self._apply_rope(q, freqs_q, mscale)
 
-        k, _ = self.wk(hidden_states)  # [b, s, head_dim]
         if cp_size > 1:
             k = all_gather_cp(k, dim=1, group=cp_group)  # [b, s_global, hd]
         k = self.k_norm(k)
@@ -566,7 +704,10 @@ class DSAIndexer(paddle.nn.Layer):
         q = rotate_activation(q, use_fast_hadamard=self.use_fast_hadamard)
         k = rotate_activation(k, use_fast_hadamard=self.use_fast_hadamard)
 
-        weights, _ = self.weights_proj(hidden_states)
+        if _ACCURACY_COMPATIBLE_KERNEL:
+            weights, _ = _accuracy_compat_linear(self.weights_proj, hidden_states)
+        else:
+            weights, _ = self.weights_proj(hidden_states)
         weights = weights * (self.n_heads**-0.5) * self.softmax_scale
 
         return q, k, weights
@@ -1454,14 +1595,51 @@ class DSAttention(FleetLayer):
 
         DSAIndexerLossLoggingHelper.register_total_num_layers(config)
         self.layer_number = layer_number
+        self.is_mtp_layer = is_mtp_layer
         self.attn_mask_type = attn_mask_type
         self.index_topk_freq = config.dsa_indexer_topk_freq or 1
         self.index_skip_topk_offset = config.dsa_indexer_skip_topk_offset or 0
         indexer_types = config.dsa_indexer_types
+        share_for_mtp_iteration = getattr(
+            config, "dsa_index_share_for_mtp_iteration", False
+        )
+        # LayerSpec extra_kwargs win over TransformerBlock's i+1 argument, so
+        # the live graph still passes 0-based decoder indices. Indexer_types
+        # is a 0-based list; keep holder keys on the same numbering.
+        layer_index = layer_number
         if is_mtp_layer:
-            indexer_type = "full"
-        elif indexer_types is not None and layer_number < len(indexer_types):
-            indexer_type = indexer_types[layer_number]
+            # E-223: the MTP layer OWNS an indexer in the official checkpoint.
+            #
+            # ``index_share_for_mtp_iteration`` was being read as "the MTP layer has no
+            # indexer, it reuses the last decoder layer's top-k", which makes
+            # ``skip_topk`` true and skips building the module at all (see below). The
+            # frozen official weight index settles that this reading is wrong: it ships
+            # ``model.layers.<L>.self_attn.indexer.*`` for exactly the 21 decoder layers
+            # marked ``full`` in ``indexer_types`` PLUS layer ``num_hidden_layers``,
+            # which IS the MTP layer. ``indexer_types`` has exactly
+            # ``num_hidden_layers`` entries, so it describes only the decoder and says
+            # nothing about MTP. A config flag cannot override shipped parameters: if
+            # the MTP layer really borrowed a decoder indexer, there would be no MTP
+            # indexer in the checkpoint to load.
+            #
+            # Treating it as ``shared`` therefore silently dropped five real parameter
+            # tensors (they showed up as "exist in checkpoint but not in state_dict")
+            # and ran MTP sparse attention against a BORROWED key selection. The
+            # reference implementation builds the indexer here, and E-218 had already
+            # narrowed the last forward difference to this layer with a bit-exact input.
+            #
+            # The flag itself is not dead: the model card describes IndexShare as reuse
+            # across every four sparse-attention layers, and describes MTP separately as
+            # a speculative-decoding feature, so it most plausibly governs reuse across
+            # MTP DRAFTING ITERATIONS at inference rather than the training-time module
+            # inventory. Its original meaning is preserved when the symmetric
+            # accuracy-compatible switch is off, so nothing outside alignment changes.
+            if getattr(config, "use_accuracy_compatible", False):
+                indexer_type = "full"
+            else:
+                indexer_type = "shared" if share_for_mtp_iteration else "full"
+        elif indexer_types is not None and layer_index < len(indexer_types):
+            indexer_type = indexer_types[layer_index]
         else:
             indexer_type = (
                 "shared"
@@ -1478,16 +1656,30 @@ class DSAttention(FleetLayer):
                 f"Unsupported DSA indexer type {indexer_type!r} for layer {layer_number}."
             )
         self.skip_topk = indexer_type == "shared"
-        self.index_share = self.skip_topk or (
-            indexer_types is not None
-            and not is_mtp_layer
-            and "shared" in indexer_types[layer_number + 1 :]
+        self.index_share = (
+            self.skip_topk
+            or (
+                indexer_types is not None
+                and not is_mtp_layer
+                and "shared" in indexer_types[layer_index + 1 :]
+            )
+            or (
+                share_for_mtp_iteration
+                and not is_mtp_layer
+                and layer_number == config.num_hidden_layers - 1
+            )
         )
         if self.skip_topk:
-            if indexer_types is not None:
+            if is_mtp_layer and share_for_mtp_iteration:
+                if config.num_hidden_layers < 1:
+                    raise ValueError(
+                        "An MTP shared indexer requires a preceding decoder layer."
+                    )
+                self.source_layer = config.num_hidden_layers - 1
+            elif indexer_types is not None:
                 full_layers = [
                     index
-                    for index, layer_type in enumerate(indexer_types[:layer_number])
+                    for index, layer_type in enumerate(indexer_types[:layer_index])
                     if layer_type == "full"
                 ]
                 if not full_layers:
@@ -1496,11 +1688,14 @@ class DSAttention(FleetLayer):
                     )
                 self.source_layer = full_layers[-1]
             else:
-                self.source_layer = source_dsa_compute_layer(
-                    layer_number + 1,
-                    self.index_skip_topk_offset,
-                    self.index_topk_freq,
-                ) - 1
+                self.source_layer = (
+                    source_dsa_compute_layer(
+                        layer_number + 1,
+                        self.index_skip_topk_offset,
+                        self.index_topk_freq,
+                    )
+                    - 1
+                )
         else:
             self.source_layer = layer_number
 
@@ -1541,6 +1736,10 @@ class DSAttention(FleetLayer):
             setattr(carrier, self._HOLDER_ATTR, holder)
         return holder
 
+    def _record_index_share_topk(self, topk_holder: dict, topk_indices: Tensor):
+        if self.index_share:
+            topk_holder[self.layer_number] = topk_indices
+
     def forward(
         self,
         query: Tensor,
@@ -1564,6 +1763,11 @@ class DSAttention(FleetLayer):
         k_pos_emb: paddle.Tensor = None,
         q_absorbed: paddle.Tensor = None,
         v_b_proj_weight: paddle.Tensor = None,
+        # E-063 repro candidate: the kv-up K-part weight [h, qk_nope, kv_lora]
+        # passed under FLAGS_use_accuracy_compatible_kernel so the absorbed query
+        # can be built from the CORE's own query (pre-rope nope + roped rope),
+        # matching the torch AbsorbedMLASelfAttention pipeline.
+        k_abs_weight: paddle.Tensor = None,
     ) -> Tensor:
         """Forward pass for Sparse Attention.
 
@@ -1683,8 +1887,8 @@ class DSAttention(FleetLayer):
             _, topk_indices = self.indexer.forward(x, qr, indexer_float_mask)
             indexer_loss = None
 
-        if self.index_share and not self.skip_topk:
-            topk_holder[self.layer_number] = topk_indices
+        if self.index_share:
+            self._record_index_share_topk(topk_holder, topk_indices)
 
         # Build sparse mask
         index_mask = paddle.full(
@@ -1711,9 +1915,113 @@ class DSAttention(FleetLayer):
             combined_mask = attention_mask.cast("float32") + combined_mask
 
         # Run sparse attention (batch-first layout)
-        core_attn_out = _unfused_dsa_attention(
-            query, key, value, combined_mask, self.softmax_scale
-        )
+        if (q_absorbed is not None or k_abs_weight is not None) and v_b_proj_weight is not None:
+            # E-063 repro candidate: torch-aligned ABSORBED core. Mirror the
+            # mcore _unfused_absorbed_dsa_fn: query is the latent-space absorbed
+            # q [b,s,h,512+rope]; key = cat(kv_compressed[512], k_pos_emb[64])
+            # per head; context = softmax(qk) @ kv_compressed (latent), then the
+            # wv_b de-absorption einsum to per-head v.
+            if q_absorbed is None:
+                # build from the core's own query: [q_nope(pre-rope) | q_rope(roped)]
+                qk_hd = query.shape[-1]
+                rope_hd = (
+                    k_pos_emb.shape[-1]
+                    if k_pos_emb is not None
+                    else int(getattr(self.config, "qk_rope_head_dim", 64))
+                )
+                nope_hd = qk_hd - rope_hd
+                q_nope = query[..., :nope_hd]  # [b,s,h,192]
+                q_pe = query[..., nope_hd:]  # roped
+                bs_abs = query.shape[0] * query.shape[1]
+                qn3 = q_nope.reshape([bs_abs, query.shape[2], nope_hd]).transpose([1, 0, 2])
+                q_abs_nope = _absorb_q_nope_k_up(qn3, k_abs_weight)  # [h, bs, kv_lora]
+                q_abs_nope = q_abs_nope.transpose([1, 0, 2]).reshape(
+                    [query.shape[0], query.shape[1], query.shape[2], k_abs_weight.shape[-1]]
+                )
+                q_absorbed = paddle.concat([q_abs_nope, q_pe], axis=-1)  # [b,s,h,576]
+            # Build the absorbed key in the core's layout [s?b] matching the query.
+            # At TP>1+SP the kv latent is seq-sharded while the query/key are
+            # full-seq; gather the kv latent to the full seq first.
+            _kv_c = kv_compressed
+            if (
+                kv_compressed.ndim == 3
+                and query.ndim == 4
+                and kv_compressed.shape[0] < query.shape[1]
+            ):
+                try:
+                    from paddlefleet.tensor_parallel.mappings import (
+                        gather_from_sequence_parallel_region,
+                    )
+                    _kv_c = gather_from_sequence_parallel_region(kv_compressed)
+                    _kv_c = _kv_c.contiguous()
+                except Exception as _e:
+                    import sys as _sys
+                    print(f"[repro-e063] kv gather failed: {_e!r}", file=_sys.stderr, flush=True)
+            # Normalize the latent and the rope to the query layout [b, s, ...]
+            # (when they arrive seq-first with s at dim 0).
+            if _kv_c.ndim == 3 and query.ndim == 4 and _kv_c.shape[0] == query.shape[1]:
+                _kv_c = _kv_c.transpose([1, 0, 2])
+            if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+                # x + x*0 is an add, not a view. GEMM-ones / PyLayer / clone
+                # were PIR-folded on the live Function (still QK-only).
+                _kv_c = _kv_c + (_kv_c * 0)
+            k_latent = _kv_c.unsqueeze(2)  # [b, s, 1, kv_lora_rank]
+            if k_pos_emb.ndim == 3:
+                k_rope = k_pos_emb.unsqueeze(2)
+            elif k_pos_emb.ndim == 4:
+                k_rope = k_pos_emb
+            else:
+                k_rope = k_pos_emb
+            if (
+                k_rope.ndim == 4
+                and query.ndim == 4
+                and k_rope.shape[0] == query.shape[1]
+                and k_rope.shape[1] == query.shape[0]
+            ):
+                k_rope = k_rope.transpose([1, 0, 2, 3])
+            # When the rope is still full-length (seq at the leading dim with no
+            # query-match), shard it to the local seq (world-4 fallback).
+            if k_rope.shape[1] != k_latent.shape[1] and k_rope.shape[1] % k_latent.shape[1] == 0:
+                try:
+                    import paddle.distributed as _pd
+                    _tp_world = k_rope.shape[1] // k_latent.shape[1]
+                    _tp_rank = _pd.get_rank() % _tp_world
+                    _seg = k_latent.shape[1]
+                    k_rope = k_rope[:, _tp_rank * _seg : (_tp_rank + 1) * _seg]
+                except Exception as _e:
+                    import sys as _sys
+                    print(f"[repro-e063] k shard fallback failed: {_e!r}", file=_sys.stderr, flush=True)
+            key_abs = paddle.concat([k_latent, k_rope], axis=-1)  # [b, s, 1, 576]
+            # Dummy, not k_latent: live PIR CSE'd key[..., :v] to the
+            # k_latent argument (E-314 QK-only). Isolated in-function
+            # slice is 0diff vs torch; zeros cannot CSE to concat-left.
+            value = paddle.zeros(k_latent.shape, dtype=k_latent.dtype)
+            latent_flat = _unfused_dsa_attention(
+                q_absorbed, key_abs, value, combined_mask, self.softmax_scale
+            )  # [b, s, nhpp * kv_lora_rank]
+            nh = q_absorbed.shape[2]
+            kv_rank = _kv_c.shape[-1]
+            latent_out = latent_flat.reshape([b, sq, nh, kv_rank])  # [b,s,h,kv]
+            if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+                _bs = b * sq
+                _lat = latent_out.transpose([2, 0, 1, 3]).reshape(
+                    [nh, _bs, kv_rank]
+                )
+                _v = v_b_proj_weight.transpose([0, 2, 1])  # [h, c, d]
+                core_attn_out = (
+                    paddle.bmm(_lat, _v)
+                    .reshape([nh, b, sq, -1])
+                    .transpose([1, 2, 0, 3])
+                )
+            else:
+                core_attn_out = paddle.einsum(
+                    "bshc,hdc->bshd", latent_out, v_b_proj_weight
+                )  # [b, s, h, v_head_dim] (mirrors mcore einsum("sbhc,hdc->sbhd"))
+            core_attn_out = core_attn_out.reshape([b, sq, nh * core_attn_out.shape[-1]])
+        else:
+            core_attn_out = _unfused_dsa_attention(
+                query, key, value, combined_mask, self.softmax_scale
+            )
 
         # Attach indexer loss if training
         if self.training and indexer_loss is not None:

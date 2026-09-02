@@ -29,6 +29,9 @@ from paddle.distributed.communication.reduce_scatter import _reduce_scatter_base
 from paddle.distributed.flex_checkpoint.dcp.sharded_weight import (
     build_sharded_state_dict,
 )
+from paddle.distributed.fleet.utils.sequence_parallel_utils import (
+    mark_as_sequence_parallel_parameter,
+)
 
 from ..parallel_state import (
     get_global_memory_buffer,
@@ -272,6 +275,48 @@ def _initialize_affine_weight_cpu(
     return None
 
 
+class _EmbedFp32MainGrad(paddle.autograd.Function):
+    """UAC embedding lookup whose wgrad lands in fp32 main_grad.
+
+    Forward is `weight[ids]` in the stored dtype so the activation is unchanged.
+    Backward scatters `grad_output.float()` into `weight.main_grad` (created as
+    fp32 if MixPrecision has not attached it yet) and returns a dummy
+    `weight.grad` so autograd does not also write a bf16 accumulator.
+    """
+
+    @staticmethod
+    def forward(ctx, weight, ids):
+        ctx.save_for_backward(weight, ids)
+        ctx.weight_ref = weight
+        return weight[ids]
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        weight, ids = ctx.saved_tensor()
+        if hasattr(weight, "main_grad") and weight.main_grad is not None:
+            acc = weight.main_grad
+            if acc.dtype != paddle.float32:
+                raise RuntimeError(
+                    f"embedding main_grad dtype {acc.dtype} is not float32"
+                )
+        else:
+            acc = paddle.zeros(weight.shape, dtype=paddle.float32)
+            weight.main_grad = acc
+        # Official fused scatter into the fp32 buffer (same kernel family as
+        # IndexingBackward). index_add_ is a different kernel and does not
+        # reproduce proof_fp32_accumulator.
+        from paddle.incubate.nn.functional import embedding_grad_add_to_
+
+        # Kernel requires bf16 out_grad; the destination acc is fp32, so
+        # overlap rows still sum in fp32 (same as torch's two bf16->fp32
+        # casts then fp32 add, except here there is one buffer).
+        embedding_grad_add_to_(ids, acc, grad_output.astype("bfloat16"))
+        if hasattr(weight, "grad_added_to_main_grad"):
+            weight.grad_added_to_main_grad = True
+        dummy = paddle.zeros(weight.shape, dtype=weight.dtype)
+        return dummy, None
+
+
 class VocabParallelEmbedding(paddle.nn.Layer):
     """Embedding parallelized in the vocabulary dimension.
 
@@ -386,7 +431,19 @@ class VocabParallelEmbedding(paddle.nn.Layer):
             masked_input = input_
         # Get the embeddings.
         if self.deterministic_mode or self.use_accuracy_compatible:
-            output_parallel = self.weight[masked_input]
+            if os.environ.get("MODEL_REPRO_EMBED_FP32_ACCUM", "0") == "1":
+                # One fused lookup still owns the forward (bf16 W[ids], bit-identical
+                # to the default UAC path). The remaining family is the number of
+                # bf16 accumulators, not the gather kernel (E-450/E-448) and not a
+                # forward-side fp32 gather (E-precheck c02a24a8 still rounded into
+                # weight.grad). Scatter the two-branch dY into fp32 main_grad so
+                # overlap rows are summed once in fp32, matching torch's two
+                # bf16->fp32 casts then fp32 add.
+                output_parallel = _EmbedFp32MainGrad.apply(
+                    self.weight, masked_input
+                )
+            else:
+                output_parallel = self.weight[masked_input]
         else:
             # F.embedding currently has a non-deterministic backward function
             output_parallel = F.embedding(masked_input, self.weight)
@@ -711,7 +768,16 @@ def general_gemm(
         if bias is not None:
             output = paddle.nn.functional.linear(a, b, bias)
         else:
-            if use_accuracy_compatible:
+            if os.environ.get("MODEL_REPRO_MOE_TN_GEMM", "0") == "1":
+                # E-107: mcore runs torch.matmul(x, w.t()) with weight stored
+                # [out, in] contiguous (a TN GEMM); PaddleFleet stores [in, out]
+                # and issues an NN GEMM. cuBLAS selects different kernels and they
+                # differ bitwise at exactly the (M,K,N) layer-3 uses (routed fc1
+                # K6144->N4096 at ragged M; shared fc1 K6144->N2048 at M=60) while
+                # agreeing at the dense M=60 shapes. Materializing [out, in] is
+                # required: a transposed view shares storage and still dispatches NN.
+                output = paddle.matmul(a, b.t().contiguous(), transpose_y=True)
+            elif use_accuracy_compatible:
                 output = paddle.nn.functional.linear(a, b)
             else:
                 output = paddle.matmul(a, b)
@@ -948,7 +1014,63 @@ class LinearWithGradAccumulationAndAsyncCommunication(paddle.autograd.Function):
                     ),
                 )
             else:
-                grad_input, _ = general_gemm(grad_output, weight.t())
+                if ctx.use_accuracy_compatible:
+                    # E-240: THE DGRAD OPERAND LAYOUT. ``weight`` is stored
+                    # [in, out] here, so ``weight.t()`` is a transposed VIEW that
+                    # shares storage and makes cuBLAS pick its transposed-B
+                    # kernel. The reference stores the weight [out, in]
+                    # contiguous and computes ``grad_output @ weight``, an NN
+                    # GEMM. Those two kernels reduce the K = 6144 dimension in a
+                    # different order and disagree bitwise.
+                    #
+                    # E-239 measured the consequence: this was the FIRST
+                    # divergence left after the E-235 token-normalization fix. At
+                    # the MTP layer's shared-expert down projection the forward is
+                    # bit-equal at every internal boundary and the incoming
+                    # gradient is bit-equal (rank3 184,320/184,320, abssum deficit
+                    # exactly 0), yet this dgrad differed in 170 of 61,440
+                    # elements - 154 of them by exactly 1 ulp, symmetric in
+                    # direction (85 smaller / 85 larger), and concentrated on the
+                    # SMALLEST elements (median magnitude 1.29e-04 against
+                    # 3.68e-03 overall, the 2.4th percentile). That is
+                    # cancellation in a long reduction summed in a different
+                    # order, not a wrong factor.
+                    #
+                    # E-244 settled which half of that story is load-bearing, by
+                    # replaying the operands dumped from INSIDE both backward
+                    # functions (M=60, K=6144, N=1024, bf16):
+                    #   * with the [out, in] operand MATERIALIZED, both
+                    #     frameworks reproduce the reference's in-function dgrad
+                    #     bit-for-bit (0 of 61,440 differing, rank2 and rank3);
+                    #   * left as a transposed VIEW, BOTH frameworks miss the
+                    #     reference by the SAME 116 (rank2) / 107 (rank3)
+                    #     elements.
+                    # Materialization is therefore necessary and sufficient here,
+                    # and the view difference is a property of the GEMM operand
+                    # layout rather than a cross-framework defect - the same
+                    # conclusion E-107 reached for the FORWARD GEMM (see the
+                    # MODEL_REPRO_MOE_TN_GEMM branch in general_gemm above).
+                    #
+                    # The 2-D flatten below matches the reference's dispatch
+                    # shape (Megatron's local linear path flattens the leading
+                    # dimensions before torch.matmul, while grad_output here is
+                    # commonly [M, 1, K]). E-244 measured it as numerically INERT
+                    # at every shape in this profile: paddle's batched
+                    # [M,1,K] @ [K,N] and its flattened form agree in
+                    # 61,440/61,440, 122,880/122,880, 368,640/368,640 and
+                    # 491,520/491,520 elements. It is kept because it makes the
+                    # dispatch shape match the reference by construction, NOT
+                    # because it changes any bits. Default numerics unchanged.
+                    original_shape = grad_output.shape
+                    flat_grad_output = grad_output.reshape([-1, original_shape[-1]])
+                    flat_grad_input = paddle.matmul(
+                        flat_grad_output, weight.t().contiguous()
+                    )
+                    grad_input = flat_grad_input.reshape(
+                        list(original_shape[:-1]) + [weight.shape[0]]
+                    )
+                else:
+                    grad_input, _ = general_gemm(grad_output, weight.t())
         else:
             grad_input = None
 
@@ -1404,6 +1526,7 @@ class Linear(paddle.nn.Layer):
             self.weight.allreduce = True
             self.weight.is_distributed = False
             self.weight.is_expert_param = self.is_expert
+            self._mark_replicated_grad_needs_tp_reduction(self.weight)
         else:
             self.weight = None
 
@@ -1419,6 +1542,7 @@ class Linear(paddle.nn.Layer):
                     self.bias.zero_()
             self.bias.allreduce = True
             self.bias.is_distributed = False
+            self._mark_replicated_grad_needs_tp_reduction(self.bias)
         else:
             self.bias = None
 
@@ -1573,6 +1697,46 @@ class Linear(paddle.nn.Layer):
         )
 
         return output, output_bias
+
+    def _mark_replicated_grad_needs_tp_reduction(self, parameter) -> None:
+        """Mark a replicated parameter so its gradient is reduced over the TP group.
+
+        The weight is duplicated across TP ranks, but under sequence parallelism
+        each rank only sees ``s / TP`` of the sequence, so the local wgrad is a
+        PARTIAL sum over the sequence dimension. The full gradient is the sum over
+        the TP group. ``Linear.forward`` deliberately passes
+        ``sequence_parallel=False`` into the autograd function (this layer never
+        gathers or scatters), so nothing else adds that term.
+
+        Paddle's transport for it is the ``sequence_parallel`` attribute:
+        ``mark_as_sequence_parallel_parameter`` sets it, and
+        ``SPGradSyncCallback`` (PaddleFormers ``trainer/trainer_callback.py``)
+        all-reduces exactly the marked parameters over the model-parallel group
+        with ``scale=1.0`` (sum, not mean) at ``on_optimizer_begin``.
+
+        This mirrors Megatron-Core, which does the same for the duplicated case in
+        ``megatron/core/extensions/transformer_engine.py:930-935``::
+
+            if parallel_mode == "duplicated":
+                setattr(param, "sequence_parallel", self.config.sequence_parallel)
+                setattr(param, "tensor_model_parallel", False)
+
+        whose gradients ``distributed/finalize_model_grads.py:408`` then all-reduces
+        over the TP group. It also mirrors PaddleFormers' own deepseek_v3
+        (``transformers/deepseek_v3/modeling.py:651-656``), which marks precisely
+        its replicated ``q_a_proj`` / ``kv_a_proj_with_mqa`` this way.
+
+        Expert parameters are excluded: their gradients live in their own
+        (expert-)data-parallel domain and are reduced by that path instead, which is
+        also why mcore only takes the duplicated branch for non-expert parameters.
+        """
+        if self.is_expert:
+            return
+        if not getattr(self.config, "sequence_parallel", False):
+            return
+        if getattr(self.config, "tensor_model_parallel_size", 1) <= 1:
+            return
+        mark_as_sequence_parallel_parameter(parameter)
 
     def sharded_state_dict(
         self,
@@ -2049,37 +2213,58 @@ class ColumnParallelLinear(paddle.nn.Layer):
                         self.config.cpu_offloading_activations
                     )
 
-        output_parallel = self._forward_impl(
-            input=input_parallel,
-            weight=weight,
-            bias=bias,
-            gradient_accumulation_fusion=self.gradient_accumulation_fusion,
-            allreduce_dgrad=allreduce_dgrad,
-            sequence_parallel=False
-            if self.explicit_expert_comm
-            else self.sequence_parallel,
-            grad_output_buffer=(
-                self.grad_output_buffer
-                if self.config.defer_embedding_wgrad_compute
-                else None
-            ),
-            wgrad_deferral_limit=(
-                self.config.wgrad_deferral_limit
-                if self.config.defer_embedding_wgrad_compute
-                else None
-            ),
-            tp_group=self.tp_group,
-            use_accuracy_compatible=getattr(
-                self.config, "use_accuracy_compatible", False
-            ),
-            fp8=self.fp8,
-            fp8_wgrad=self.fp8_wgrad,
-            inp_quant_func=self.inp_quant_func,
-            weight_quant_func=self.weight_quant_func,
-            use_pow2_scale=self.use_pow2_scale,
-            use_ue8m0=self.use_ue8m0,
-            save_original_input=self.save_original_input,
+        _colpar_acc = (
+            os.environ.get("MODEL_REPRO_COLPAR_ACC", "0") == "1"
+            and get_pg_size(self.tp_group) <= 1
         )
+        if _colpar_acc:
+            if os.environ.get("MODEL_REPRO_MOE_TN_GEMM", "0") == "1":
+                # E-107: TN layout — matmul(x, w.t().contiguous(), transpose_y=True)
+                # is bit-exact with mcore's matmul(x, w.t()) (e107 probes).
+                output_parallel = paddle.matmul(
+                    input_parallel.contiguous(),
+                    weight.t().contiguous(),
+                    transpose_y=True,
+                )
+            else:
+                # E-101 probe: for non-parallel column linears (e.g. EP1/ETP1 MoE
+                # expert up_gate_proj) run a plain contiguous F.linear so the bf16
+                # rounding matches the torch eager/TE path, mirroring the o_proj fix.
+                output_parallel = F.linear(
+                    input_parallel.contiguous(), weight, bias
+                )
+        else:
+            output_parallel = self._forward_impl(
+                input=input_parallel,
+                weight=weight,
+                bias=bias,
+                gradient_accumulation_fusion=self.gradient_accumulation_fusion,
+                allreduce_dgrad=allreduce_dgrad,
+                sequence_parallel=False
+                if self.explicit_expert_comm
+                else self.sequence_parallel,
+                grad_output_buffer=(
+                    self.grad_output_buffer
+                    if self.config.defer_embedding_wgrad_compute
+                    else None
+                ),
+                wgrad_deferral_limit=(
+                    self.config.wgrad_deferral_limit
+                    if self.config.defer_embedding_wgrad_compute
+                    else None
+                ),
+                tp_group=self.tp_group,
+                use_accuracy_compatible=getattr(
+                    self.config, "use_accuracy_compatible", False
+                ),
+                fp8=self.fp8,
+                fp8_wgrad=self.fp8_wgrad,
+                inp_quant_func=self.inp_quant_func,
+                weight_quant_func=self.weight_quant_func,
+                use_pow2_scale=self.use_pow2_scale,
+                use_ue8m0=self.use_ue8m0,
+                save_original_input=self.save_original_input,
+            )
 
         gather_output = self.gather_output
         # Use the runtime gather output if it's set explicitly.
@@ -2378,35 +2563,59 @@ class RowParallelLinear(paddle.nn.Layer):
                         self.config.cpu_offloading_activations
                     )
 
-        output_parallel = self._forward_impl(
-            input=input_parallel,
-            weight=self.weight,
-            bias=None,
-            gradient_accumulation_fusion=self.gradient_accumulation_fusion,
-            allreduce_dgrad=allreduce_dgrad,
-            sequence_parallel=False,
-            tp_group=None,
-            grad_output_buffer=None,
-            use_accuracy_compatible=getattr(
-                self.config, "use_accuracy_compatible", False
-            ),
-            fp8=self.fp8,
-            fp8_wgrad=self.fp8_wgrad,
-            inp_quant_func=self.inp_quant_func,
-            weight_quant_func=self.weight_quant_func,
-            use_pow2_scale=self.use_pow2_scale,
-            use_ue8m0=self.use_ue8m0,
-            save_original_input=self.save_original_input,
-        )
+        if os.environ.get("MODEL_REPRO_OPROJ_ACC", "0") == "1":
+            if os.environ.get("MODEL_REPRO_MOE_TN_GEMM", "0") == "1":
+                # E-107: TN layout — matmul(x, w.t().contiguous(), transpose_y=True)
+                # is bit-exact with mcore's matmul(x, w.t()) (e107 probes).
+                output_parallel = paddle.matmul(
+                    input_parallel.contiguous(),
+                    self.weight.t().contiguous(),
+                    transpose_y=True,
+                )
+            else:
+                # E-091 probe: run the local row-parallel GEMM as a
+                # plain contiguous F.linear so the bf16 rounding matches torch's TE Linear.
+                output_parallel = F.linear(
+                    input_parallel.contiguous(), self.weight, None
+                )
+        else:
+            output_parallel = self._forward_impl(
+                input=input_parallel,
+                weight=self.weight,
+                bias=None,
+                gradient_accumulation_fusion=self.gradient_accumulation_fusion,
+                allreduce_dgrad=allreduce_dgrad,
+                sequence_parallel=False,
+                tp_group=None,
+                grad_output_buffer=None,
+                use_accuracy_compatible=getattr(
+                    self.config, "use_accuracy_compatible", False
+                ),
+                fp8=self.fp8,
+                fp8_wgrad=self.fp8_wgrad,
+                inp_quant_func=self.inp_quant_func,
+                weight_quant_func=self.weight_quant_func,
+                use_pow2_scale=self.use_pow2_scale,
+                use_ue8m0=self.use_ue8m0,
+                save_original_input=self.save_original_input,
+            )
 
         # All-reduce across all the partitions.
         if self.explicit_expert_comm:
             assert self.skip_bias_add
             output_ = output_parallel
         elif self.sequence_parallel:
-            output_ = reduce_scatter_to_sequence_parallel_region(
-                output_parallel, group=self.tp_group
-            )
+            if os.environ.get("MODEL_REPRO_ROWPAR_FP32", "0") == "1":
+                # E-090 probe: do the TP reduce-scatter in fp32 so the row-parallel
+                # reduction order/precision matches the torch TE path, then cast back.
+                _odt = output_parallel.dtype
+                output_ = reduce_scatter_to_sequence_parallel_region(
+                    output_parallel.cast("float32"), group=self.tp_group
+                ).cast(_odt)
+            else:
+                output_ = reduce_scatter_to_sequence_parallel_region(
+                    output_parallel, group=self.tp_group
+                )
         else:
             output_ = reduce_from_tensor_model_parallel_region(
                 output_parallel, group=self.tp_group, is_expert=self.is_expert

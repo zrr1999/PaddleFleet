@@ -303,6 +303,45 @@ class GPTEmbedding(FleetLayer):
                     "multi_latent_attention is not supported when gpt_model_use_experimental_version=True and sequence_parallel=True"
                 )
         input_ids = dict_args["input_ids"]
+        # E-217: align the MTP tail convention with the reference implementation.
+        #
+        # This side never rolls: the collate pads the carrier to
+        # ``max_seq_len + num_nextn_predict_layers`` and each MTP depth takes the
+        # offset slice ``ids[d + 1 : d + 1 + S]``, so the positions vacated by the
+        # shift are filled with the REAL trailing carrier tokens (the pad token).
+        # Megatron instead applies ``roll(-1)`` and zero-fills the vacated tail
+        # (megatron/core/transformer/multi_token_prediction.py roll_tensor), so at
+        # depth d its last ``d + 1`` MTP positions embed token id 0.
+        #
+        # E-217 measured exactly this: at depth 1 the MTP branch entry embedding was
+        # bit-identical at every position except the last, where this side had
+        # ``embedding(pad_token_id)`` (row abssum 50.273733) and the reference had
+        # ``embedding(0)`` (29.555188), the two rows read directly out of the run
+        # weights. Those positions are unsupervised on both sides, but they are not
+        # inert: the MTP transformer layer's MoE dispatch groups tokens by expert, so
+        # one differing token changes the accumulation the OTHER tokens see.
+        #
+        # Zeroing the last ``num_nextn_predict_layers`` carrier ids reproduces the
+        # reference tail for every depth, because ``d + 1`` applications of
+        # roll-and-zero-fill leave exactly ``d + 1`` trailing zeros. The main path is
+        # unaffected: it slices ``input_ids[:, :-num_nextn_predict_layers]``.
+        if (
+            getattr(self.config, "use_accuracy_compatible", False)
+            and input_ids is not None
+            and self.config.num_nextn_predict_layers is not None
+            and self.config.num_nextn_predict_layers > 0
+            and not self.config.mtp_load_weight_only
+            and input_ids.shape[-1] > self.config.num_nextn_predict_layers
+        ):
+            _mtp_tail = self.config.num_nextn_predict_layers
+            input_ids = paddle.concat(
+                [
+                    input_ids[..., :-_mtp_tail],
+                    paddle.zeros_like(input_ids[..., -_mtp_tail:]),
+                ],
+                axis=-1,
+            )
+            dict_args["input_ids"] = input_ids
         labels = dict_args.get("labels", None)
         if labels is not None:
             labels = labels.cuda()
@@ -458,7 +497,7 @@ class GPTEmbedding(FleetLayer):
                 else:
                     inputs_embeds_extra = decoder_input[
                         :, -self.config.num_nextn_predict_layers :, :
-                    ]  # [B, S, H]
+                    ]
                     inputs_embeds = decoder_input[
                         :, : -self.config.num_nextn_predict_layers, :
                     ]
@@ -469,7 +508,6 @@ class GPTEmbedding(FleetLayer):
                         get_context_parallel_world_size() > 1
                         and self.config.experimental_dataflow
                     ):
-                        # In EB data flow, main input embed apply CP scatter here
                         inputs_embeds = ContextParallelScatterOp.apply(
                             inputs_embeds,
                             axis=1,
@@ -485,7 +523,7 @@ class GPTEmbedding(FleetLayer):
                             inputs_embeds.reshape([batch_size, -1, hidden_size])
                             .permute(1, 0, 2)
                             .contiguous()
-                        )  # change to [S, B, H]
+                        )
                     mtp_emb_res = [inputs_embeds]
                     for depth in range(self.config.num_nextn_predict_layers):
                         inputs_embeds_mtp = paddle.concat(
@@ -495,12 +533,10 @@ class GPTEmbedding(FleetLayer):
                             ],
                             axis=1,
                         )
-
                         if (
                             get_context_parallel_world_size() > 1
                             and self.config.experimental_dataflow
                         ):
-                            # In EB data flow, mtp input embed apply CP scatter here
                             inputs_embeds_mtp = ContextParallelScatterOp.apply(
                                 inputs_embeds_mtp,
                                 axis=1,
@@ -520,7 +556,7 @@ class GPTEmbedding(FleetLayer):
                                 )
                                 .permute(1, 0, 2)
                                 .contiguous()
-                            )  # change to [S, B, H]
+                            )
                         mtp_emb_res.append(inputs_embeds_mtp)
 
             if self.multimodal_embedding:

@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import os
 import functools
 import logging
 import math
@@ -1153,6 +1154,9 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_types: list[str] | None = None
     """Optional per-layer DSA indexer layout (``full`` or ``shared``)."""
 
+    dsa_index_share_for_mtp_iteration: bool = False
+    """Whether MTP iterations reuse top-k indices from the final decoder layer."""
+
     dsa_indexer_loss_coeff: float | None = None
     """KL loss coefficient for DSA Indexer training. None disables the KL loss.
 
@@ -1399,6 +1403,7 @@ class TransformerConfig(ModelParallelConfig):
         "index_topk_freq": "dsa_indexer_topk_freq",
         "index_skip_topk_offset": "dsa_indexer_skip_topk_offset",
         "indexer_types": "dsa_indexer_types",
+        "index_share_for_mtp_iteration": "dsa_index_share_for_mtp_iteration",
         "indexer_loss_coeff": "dsa_indexer_loss_coeff",
         "indexer_use_sparse_loss": "dsa_indexer_use_sparse_loss",
         "indexer_rotary_interleaved": "dsa_indexer_rotary_interleaved",
@@ -1502,6 +1507,15 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+
+        # 隔离验证用：PaddleFormers 侧的 YAML -> provider 转发没有携带
+        # enable_mtp_magic_send（provider 的字段清单里没有它），所以这个轴从配置
+        # 打不开。这里用一个 env gate 在 config 定型处强制打开，让下游所有消费点
+        # （MultiTokenPredictionLayer / transformer_layer / paddle_norm /
+        # block_attn_res / hyper_connection）以及本函数后面那套校验都能看到真值。
+        # 默认关闭，因此 gate 未设置时行为与未打补丁完全一致。
+        if os.environ.get("MODEL_REPRO_FORCE_MTP_MAGIC_SEND", "0") == "1":
+            self.enable_mtp_magic_send = True
         if self.mtp_shared_last_layer:
             # When MTP reuses the last backbone TransformerLayer's parameters,
             # the MTP transformer block must have an identical structure to the

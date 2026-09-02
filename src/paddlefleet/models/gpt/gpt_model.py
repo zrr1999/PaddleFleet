@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from paddle.distributed.fleet.meta_parallel import LayerSpec
 
 
+import paddle
 from paddle.distributed import fleet
 from paddle.distributed.fleet.meta_parallel import ScheduleChunk
 
@@ -1187,7 +1188,7 @@ class GPTModel(PipelineLayer):
                         grad.contiguous(), group=comm["group"]
                     )
 
-        # mtp_embed: allreduce within dedicated sub-group
+        # Magic-send: allreduce within dedicated sub-group
         if (
             mtp_embed_weight is not None
             and hasattr(self, "_mtp_embed_global_group")

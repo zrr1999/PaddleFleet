@@ -130,6 +130,144 @@ class DistributedSoftmaxOp(PyLayer):
         return grad_input
 
 
+# E-233/E-234: deferred token normalization state.
+#
+# Under the accuracy-compatible path the per-token loss normalization is kept OUT
+# of the bf16 gradient path (see DeferTokenNormalizationOp below). The divisor the
+# gradients still owe is recorded here so the trainer can apply it to the fp32
+# gradient buffers after the backward, exactly as the reference framework does in
+# ``megatron/core/distributed/finalize_model_grads.py:586-602``.
+#
+# Only the last pipeline stage computes the loss, so only that stage records a
+# value; the trainer is responsible for broadcasting it across the pipeline group
+# (the reference does the same at ``finalize_model_grads.py:591-592``).
+_PENDING_GRADIENT_DIVISOR: dict[str, float] = {}
+
+
+def get_pending_gradient_divisor() -> float | None:
+    """Token count the current step's gradients still have to be divided by.
+
+    Returns ``None`` when the deferred-normalization path did not run, in which
+    case the gradients are already normalized and must NOT be scaled again.
+    """
+    return _PENDING_GRADIENT_DIVISOR.get("value")
+
+
+def set_pending_gradient_divisor(value: float) -> None:
+    """Publish the divisor on ranks that did not compute the loss.
+
+    Only the last pipeline stage runs the loss, so only it registers a divisor.
+    The trainer resolves the value across the pipeline group before the optimizer
+    callbacks fire and writes it back here, so that every rank - in particular the
+    gradient-inventory receipt on the earlier stages - can see the divisor its
+    gradients still owe.
+    """
+    _PENDING_GRADIENT_DIVISOR["value"] = float(value)
+
+
+def clear_pending_gradient_divisor() -> None:
+    """Drop the recorded divisor. The trainer calls this once it has applied it,
+    so that a step which somehow skips the loss cannot silently reuse a stale
+    divisor from an earlier step."""
+    _PENDING_GRADIENT_DIVISOR.pop("value", None)
+
+
+class DeferTokenNormalizationOp(PyLayer):
+    """Divide the loss for REPORTING while leaving the gradient unnormalized.
+
+    THE DEFECT THIS EXISTS TO FIX (E-233, measured; E-234, confirmed).
+
+    The token normalization used to be an ordinary division, so its reciprocal
+    entered the gradient before the logits gradient was rounded to bf16. At a
+    supervised label slot the exact gradient of a summed cross-entropy is -1.0,
+    which bf16 represents exactly; dividing first asks bf16 to represent -1/N
+    instead, and for N = 44 that costs exactly one part in 2^10:
+
+        1/44          = 0.022727272727...
+        bf16(1/44)    = 0.022705078125
+        relative error = -2^-10 = -9.765625e-04
+
+    Because the factor multiplies EVERY element of the logits gradient, every
+    downstream gradient inherited it with the same sign. That is what made the
+    weight-gradient inventory one-sided in 59 of 64 comparable families with a
+    median deficit of +0.00097318 against the reference - a 0.35% match to the
+    predicted +0.00097656.
+
+    The reference framework does not have the problem because it does not divide
+    here at all: ``calculate_per_token_loss: true`` keeps the summed gradient and
+    ``finalize_model_grads`` divides the fp32 gradient buffers afterwards
+    (``megatron/core/pipeline_parallel/schedules.py:331-335`` and
+    ``megatron/core/distributed/finalize_model_grads.py:586-602``).
+
+    THE FIX MIRRORS THAT SPLIT rather than trying to round better:
+
+      * forward divides, so the reported loss scalar is bit-for-bit what it was.
+        This matters because the loss scalar is already bit-equal to the
+        reference (E-227) and is an acceptance gate field; the fix must not move
+        it.
+      * backward multiplies by ``backward_scale`` INSTEAD of 1/N, so the bf16
+        logits gradient carries exactly representable values.
+      * the divisor is recorded in ``_PENDING_GRADIENT_DIVISOR`` and applied by
+        the trainer to the fp32 gradient buffers.
+
+    ``backward_scale`` exists for the MTP branch. The reference funnels every
+    branch through ONE global divisor (the main loss's token count) and corrects
+    each branch by the ratio ``original_num_tokens / num_tokens``
+    (``megatron/core/transformer/multi_token_prediction.py:1054-1065``). Passing
+    ``main_tokens / branch_tokens`` here reproduces that: after the trainer
+    divides by ``main_tokens``, the branch has been divided by
+    ``branch_tokens``, which is what it owed.
+
+    Not gated internally: callers apply it only under
+    ``_use_accuracy_compatible_kernel()``, keeping the default numerics untouched.
+    """
+
+    @staticmethod
+    def forward(ctx, loss_sum, divisor, backward_scale):
+        ctx.backward_scale = float(backward_scale)
+        # THE DIVISOR MUST BE A 0-d TENSOR OF THE SAME DTYPE, not a python float.
+        # On GPU those two are NOT the same computation: dividing a float32 tensor
+        # by a python float can land one ulp away from dividing by a float32 0-d
+        # tensor. Measured on this device with the real step-1 MTP loss sum
+        # 567.9686279296875:
+        #     x / paddle.to_tensor(44.0)  ->  12.908377647399902  (0x414e88b7)
+        #     x / 44.0                    ->  12.908378601074219  (0x414e88b8)
+        # The first is the value the previous ``loss / lossmask.sum()`` produced
+        # and the one that is bit-equal to the reference, so the fix has to keep
+        # it. Building the divisor with ``paddle.full`` restores bit-equality: 0
+        # mismatches over 19999 sampled magnitudes.
+        divisor_tensor = paddle.full([], float(divisor), dtype=loss_sum.dtype)
+        return loss_sum / divisor_tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output * ctx.backward_scale
+
+
+def _normalize_loss_by_tokens(
+    loss_sum: Tensor,
+    valid_tokens: float,
+    main_tokens: float | None = None,
+) -> Tensor:
+    """Token-normalize ``loss_sum``, deferring the gradient share when the
+    accuracy-compatible path is active.
+
+    ``main_tokens`` is the divisor the trainer will apply globally; it defaults to
+    ``valid_tokens`` for the main loss. An auxiliary branch passes the main
+    loss's count so a single global divisor serves every branch.
+    """
+    if not _use_accuracy_compatible_kernel() or valid_tokens <= 0:
+        return loss_sum / valid_tokens
+
+    if main_tokens is None or main_tokens <= 0:
+        main_tokens = valid_tokens
+        _PENDING_GRADIENT_DIVISOR["value"] = float(main_tokens)
+
+    return DeferTokenNormalizationOp.apply(
+        loss_sum, valid_tokens, main_tokens / valid_tokens
+    )
+
+
 def subbatch(
     f, arg_idx, axis, bs, out_idx, use_recompute=False, same_arg_idx={}
 ):
@@ -233,6 +371,14 @@ class LanguageLoss(FleetLayer):
             config.loss_subbatch_sequence_length
         )
         self.use_subbatch = self.loss_subbatch_sequence_length > 0
+
+        # E-233/E-234: when an auxiliary branch (MTP) is normalized by its own
+        # token count, this carries the MAIN loss's count so that one global
+        # divisor applied by the trainer serves every branch, matching the
+        # reference's original_num_tokens / num_tokens correction. ``None`` means
+        # "this call IS the main loss", which is the case that registers the
+        # global divisor.
+        self._deferred_main_tokens: float | None = None
 
     def forward_impl(self, logits: Tensor | tuple, labels: Tensor) -> Tensor:
         # Fused linear + cross-entropy path: `logits` is actually a
@@ -362,12 +508,26 @@ class LanguageLoss(FleetLayer):
                 f"shape={list(loss.shape)} md5={loss.cast('float32')._md5sum()}",
                 flush=True,
             )
+            if os.environ.get("MODEL_REPRO_PER_TOKEN_VALUES"):
+                # An md5 tells you the buffers differ, not where. The masked sum can be
+                # bit-identical while ignored positions differ, so the digest alone cannot
+                # say whether a SUPERVISED position disagrees. Print the values (one short
+                # sequence) so the two stacks can be compared position by position.
+                _flat = loss.cast("float32").reshape([-1]).numpy()
+                print(
+                    f"per_token_loss_values: rank={dist.get_rank()} "
+                    f"n={_flat.size} "
+                    f"hex={_flat.tobytes().hex()}",
+                    flush=True,
+                )
 
         lossmask = labels != self.ignored_index
+        _valid_tokens = -1.0
         if (~lossmask).all():
             loss = paddle.mean(loss) * 0.0
         else:
             lossmask = lossmask.reshape([-1]).cast(paddle.float32)
+            _valid_tokens = float(lossmask.sum())
 
             # Loss-path MD5 probe: per-token loss and lossmask
             if (
@@ -442,14 +602,22 @@ class LanguageLoss(FleetLayer):
                 loss = paddle.sum(
                     loss.cast(paddle.float32).reshape([-1]) * lossmask
                 )
-                loss = loss / lossmask.sum()
+                # E-233/E-234: under the accuracy-compatible path the division is
+                # value-only and the gradient share is deferred to the fp32
+                # gradient buffers. See DeferTokenNormalizationOp.
+                loss = _normalize_loss_by_tokens(
+                    loss,
+                    _valid_tokens,
+                    main_tokens=self._deferred_main_tokens,
+                )
 
         if _use_accuracy_compatible_kernel():
             # 定位锚点 2：mask + 归一化后的标量 loss，与锚点 1 配合可切开
             # 「CE 上游差异」和「lossmask / valid_token / 除法差异」。
             print(
                 f"\nfinal_loss: rank={dist.get_rank()} "
-                f"val={float(loss):.20f} md5={loss.cast('float32')._md5sum()}",
+                f"val={float(loss):.20f} md5={loss.cast('float32')._md5sum()} "
+                f"valid_tokens={_valid_tokens!r}",
                 flush=True,
             )
 
@@ -470,6 +638,92 @@ class LanguageLoss(FleetLayer):
         ):
             return recompute(self.forward_impl, logits, labels)
         return self.forward_impl(logits, labels)
+
+    def _mtp_loss_for_depth(
+        self, depth, mtp_logits, labels_ori, seq_length, mtp_loss
+    ):
+        """Compute one MTP depth's loss and append it to ``mtp_loss``.
+
+        Extracted verbatim from ``forward`` (E-234) so the deferred-normalization
+        state set up around the depth loop is scoped by a try/finally rather than
+        by an ever-growing loop body. No numerics changed in the move; the only
+        edit is that the inline experimental-version division now also routes
+        through ``_normalize_loss_by_tokens``.
+        """
+        logits_cur_depth = mtp_logits[depth]
+        labels_cur_depth = labels_ori[
+            :, (depth + 1) : (depth + 1 + seq_length)
+        ]
+        if self.config.gpt_model_use_experimental_version:
+            # Align with EB: compute per-token loss matrix and reduce
+            # with global sum/count instead of going through forward_impl
+            # which applies line-wise loss.
+
+            if get_context_parallel_world_size() > 1:
+                # In EB data flow and CP size > 1, since we do not use _forward
+                # we need to scatter labels to cp local here.
+                labels_cur_depth = ContextParallelScatterOp.apply(
+                    labels_cur_depth,
+                    axis=1,
+                    mode=self.config.cp_balance_mode,
+                )
+
+            if self.config.fused_linear_ce_loss_chunk > 0:
+                loss_matrix_cur_depth = self._forward(
+                    logits_cur_depth,
+                    labels_cur_depth,
+                )
+            else:
+                if (
+                    self.config.gpt_model_use_experimental_version
+                    and self.config.sequence_parallel
+                ):
+                    logits_cur_depth = logits_cur_depth.reshape(
+                        [
+                            labels_cur_depth.shape[0],
+                            -1,
+                            logits_cur_depth.shape[-1],
+                        ]
+                    )
+                loss_matrix_cur_depth = self.loss_func(
+                    logits_cur_depth.cast("float32"),
+                    labels_cur_depth,
+                )
+
+            if get_context_parallel_world_size() > 1:
+                # In EB data flow and CP size > 1, loss and labels need to be gathered back.
+                loss_matrix_cur_depth = ContextParallelGatherOp.apply(
+                    loss_matrix_cur_depth,
+                    axis=1,
+                    mode=self.config.cp_balance_mode,
+                )
+                labels_cur_depth = ContextParallelGatherOp.apply(
+                    labels_cur_depth,
+                    axis=1,
+                    mode=self.config.cp_balance_mode,
+                )
+
+            lossmask_cur_depth = (
+                labels_cur_depth != self.ignored_index
+            ).cast(paddle.float32)
+            loss_matrix_cur_depth = loss_matrix_cur_depth.cast(
+                paddle.float32
+            ).reshape([-1]) * lossmask_cur_depth.reshape([-1])
+            _depth_tokens = float(lossmask_cur_depth.sum())
+            if _depth_tokens > 0:
+                loss_cur_depth = _normalize_loss_by_tokens(
+                    loss_matrix_cur_depth.sum(),
+                    _depth_tokens,
+                    main_tokens=self._deferred_main_tokens,
+                )
+            else:
+                loss_cur_depth = loss_matrix_cur_depth.sum() * 0.0
+        else:
+            loss_cur_depth = self._forward(
+                logits_cur_depth,
+                labels_cur_depth,
+            )
+        mtp_loss.append(loss_cur_depth)
 
     def forward(self, logits: Tensor | list, labels: Tensor) -> Tensor:
         if isinstance(logits, list):
@@ -492,81 +746,32 @@ class LanguageLoss(FleetLayer):
                 else:
                     lm_loss = self._forward(logits[0], lm_labels)
 
-                for depth in range(self.config.num_nextn_predict_layers):
-                    logits_cur_depth = mtp_logits[depth]
-                    labels_cur_depth = labels_ori[
-                        :, (depth + 1) : (depth + 1 + seq_length)
-                    ]
-                    if self.config.gpt_model_use_experimental_version:
-                        # Align with EB: compute per-token loss matrix and reduce
-                        # with global sum/count instead of going through forward_impl
-                        # which applies line-wise loss.
+                # E-233/E-234: the main loss above registered the global divisor
+                # the trainer will apply to the fp32 gradient buffers. Every MTP
+                # depth below must therefore be told to normalize its VALUE by its
+                # own (rolled, hence smaller) token count while charging its
+                # GRADIENT against that same global divisor. This mirrors the
+                # reference's original_num_tokens / num_tokens correction at
+                # megatron/core/transformer/multi_token_prediction.py:1054-1065.
+                _main_tokens = get_pending_gradient_divisor()
 
-                        if get_context_parallel_world_size() > 1:
-                            # In EB data flow and CP size > 1, since we do not use _forward
-                            # we need to scatter labels to cp local here.
-                            labels_cur_depth = ContextParallelScatterOp.apply(
-                                labels_cur_depth,
-                                axis=1,
-                                mode=self.config.cp_balance_mode,
-                            )
-
-                        if self.config.fused_linear_ce_loss_chunk > 0:
-                            loss_matrix_cur_depth = self._forward(
-                                logits_cur_depth,
-                                labels_cur_depth,
-                            )
-                        else:
-                            if (
-                                self.config.gpt_model_use_experimental_version
-                                and self.config.sequence_parallel
-                            ):
-                                logits_cur_depth = logits_cur_depth.reshape(
-                                    [
-                                        labels_cur_depth.shape[0],
-                                        -1,
-                                        logits_cur_depth.shape[-1],
-                                    ]
-                                )
-                            loss_matrix_cur_depth = self.loss_func(
-                                logits_cur_depth.cast("float32"),
-                                labels_cur_depth,
-                            )
-
-                        if get_context_parallel_world_size() > 1:
-                            # In EB data flow and CP size > 1, loss and labels need to be gathered back.
-                            loss_matrix_cur_depth = (
-                                ContextParallelGatherOp.apply(
-                                    loss_matrix_cur_depth,
-                                    axis=1,
-                                    mode=self.config.cp_balance_mode,
-                                )
-                            )
-                            labels_cur_depth = ContextParallelGatherOp.apply(
-                                labels_cur_depth,
-                                axis=1,
-                                mode=self.config.cp_balance_mode,
-                            )
-
-                        lossmask_cur_depth = (
-                            labels_cur_depth != self.ignored_index
-                        ).cast(paddle.float32)
-                        loss_matrix_cur_depth = loss_matrix_cur_depth.cast(
-                            paddle.float32
-                        ).reshape([-1]) * lossmask_cur_depth.reshape([-1])
-                        if lossmask_cur_depth.sum().item() > 0:
-                            loss_cur_depth = (
-                                loss_matrix_cur_depth.sum()
-                                / lossmask_cur_depth.sum()
-                            )
-                        else:
-                            loss_cur_depth = loss_matrix_cur_depth.sum() * 0.0
-                    else:
-                        loss_cur_depth = self._forward(
-                            logits_cur_depth,
-                            labels_cur_depth,
+                # forward_impl reads this to decide whether it is normalizing the
+                # MAIN loss (registers the global divisor) or an AUXILIARY branch
+                # (charges its gradient against the already-registered one).
+                # Restored in the finally below so a later main-loss call in the
+                # same process cannot inherit it.
+                self._deferred_main_tokens = _main_tokens
+                try:
+                    for depth in range(self.config.num_nextn_predict_layers):
+                        self._mtp_loss_for_depth(
+                            depth,
+                            mtp_logits,
+                            labels_ori,
+                            seq_length,
+                            mtp_loss,
                         )
-                    mtp_loss.append(loss_cur_depth)
+                finally:
+                    self._deferred_main_tokens = None
             else:
                 lm_loss = self._forward(logits[0], lm_labels)
                 if get_tensor_model_parallel_world_size() > 1:
@@ -693,7 +898,29 @@ class LanguageLoss(FleetLayer):
                     # This matches Megatron's behavior where MTP contributes to training
                     # gradients without affecting the reported loss value.
                     if self.config.add_mtp_loss:
-                        return main_loss + loss - loss.detach()
+                        # E-226: the parenthesisation is load-bearing, not cosmetic.
+                        #
+                        # ``main + loss - loss.detach()`` evaluates left to right, so it
+                        # forms ``main + loss`` FIRST and then subtracts. In float32 that
+                        # round trip is lossy whenever ``loss`` is large enough relative
+                        # to ``main``: with main 11.810652732849121 and 0.1 * mtp
+                        # 1.2908377647399902 it returns 11.810651779174805, one ulp low.
+                        # The comment above promises the scalar is unchanged, and this is
+                        # the form that actually delivers it: ``loss - loss.detach()`` is
+                        # exactly 0.0 with gradient 1, and adding an exact zero cannot
+                        # perturb ``main``.
+                        #
+                        # It surfaced only once the MTP loss itself became bit-exact
+                        # (E-226 aligned the MTP rope positions): before that the wrong
+                        # ``loss`` value happened to round back onto ``main``, so the
+                        # reported loss looked right for the wrong reason. It matters for
+                        # the acceptance loss gate, which compares IEEE bit patterns.
+                        #
+                        # The non-accuracy-compatible branch below carries the same
+                        # left-to-right form for the same gradient-only purpose; it is
+                        # left alone here to keep this change confined to the symmetric
+                        # alignment path.
+                        return main_loss + (loss - loss.detach())
                     else:
                         return main_loss
                 else:

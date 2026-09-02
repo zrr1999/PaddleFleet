@@ -16,6 +16,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 
+import os
+
 import paddle
 import paddle.distributed as dist
 from paddle.distributed.communication.reduce_scatter import _reduce_scatter_base

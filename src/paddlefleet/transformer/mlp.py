@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -207,6 +208,29 @@ class MLP(FleetLayer):
 
         nvtx_range_push(suffix="activation")
 
+        if os.environ.get("MODEL_REPRO_SWIGLU_EAGER", "0") == "1":
+            # E-092 probe: mirror mcore's swiglu_eager exactly
+            # (chunk(y, 2, -1) -> F.silu(y_1) * y_2) instead of the fused kernels,
+            # so the bf16 activation between the bit-exact fc1 and fc2 matches torch.
+            if bias_parallel is not None:
+                intermediate_parallel = intermediate_parallel + bias_parallel
+            _y1, _y2 = paddle.chunk(intermediate_parallel, 2, axis=-1)
+            intermediate_parallel = F.silu(_y1) * _y2
+            if per_token_scale is not None:
+                # E-112 probe: mcore folds the routing probability into the
+                # ACTIVATION before fc2 (Megatron experts.py:786-788):
+                #   original_dtype = x.dtype; x = x * probs; x = x.to(original_dtype)
+                # `per_token_scale` arrives already shaped [tokens, 1] from the MoE
+                # combine, matching mcore's permuted_probs broadcast.
+                _orig_dtype = intermediate_parallel.dtype
+                intermediate_parallel = intermediate_parallel * per_token_scale
+                intermediate_parallel = intermediate_parallel.to(_orig_dtype)
+            nvtx_range_pop(suffix="activation")
+            nvtx_range_push(suffix="down_proj")
+            output, output_bias = self.down_proj(intermediate_parallel)
+            nvtx_range_pop(suffix="down_proj")
+            return output, output_bias
+
         # Alignment mode: use Paddle native F.swiglu
         _use_paddle_swiglu = getattr(
             self.config, "gpt_model_use_experimental_version", False
@@ -310,6 +334,35 @@ class MLP(FleetLayer):
                         clamp_value=self.config.activation_func_clamp_value,
                         use_accuracy_compatible=self.use_accuracy_compatible,
                     )
+                    # E-456: one-shot forward dump of SwiGLU-out (= fc2 X)
+                    # for MTP shared only. No register_hook: hooks have
+                    # changed enorm on this graph (E-421). Observer check
+                    # is family-scan vs dump-off e446.
+                    if (
+                        os.environ.get("MODEL_REPRO_MTP_SHARED_SWIGLU_DUMP") == "1"
+                        and os.environ.get("MODEL_REPRO_LIVE_XY_DUMP_DIR")
+                        and type(self).__name__ == "StandardMLPSharedExpert"
+                    ):
+                        import paddle.distributed as _pdd3
+
+                        _rk3 = _pdd3.get_rank() if _pdd3.is_initialized() else 0
+                        _li3 = str(getattr(self, "_shared_layer_no", "-"))
+                        _live3 = os.environ["MODEL_REPRO_LIVE_XY_DUMP_DIR"]
+                        _sk = f"act_{_li3}_{_rk3}"
+                        if not getattr(type(self), "_e456_act", None):
+                            type(self)._e456_act = set()
+                        if _sk not in type(self)._e456_act:
+                            type(self)._e456_act.add(_sk)
+                            os.makedirs(_live3, exist_ok=True)
+                            _a = intermediate_parallel.detach()
+                            if _a.dtype != paddle.float32:
+                                _a = _a.cast("float32")
+                            _a.cpu().numpy().tofile(
+                                os.path.join(
+                                    _live3,
+                                    f"paddle_mtpsh_act_l{_li3}_r{_rk3}.f32.bin",
+                                )
+                            )
                 else:
                     raise ValueError("Only support fusion of gelu and swiglu")
         else:

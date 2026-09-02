@@ -166,6 +166,7 @@ class _UnpermuteGatherSumAlignedPyLayer(PyLayer):
         topk,
         hidden,
         has_padding,
+        tokens_per_expert=None,
     ):
         ctx.input_dtype = permuted_tokens.dtype
         ctx.num_total_tokens = num_total_tokens
@@ -181,7 +182,22 @@ class _UnpermuteGatherSumAlignedPyLayer(PyLayer):
             gathered = gathered * valid_rows.cast(gathered.dtype).reshape(
                 [num_tokens, 1, 1]
             )
-        output_tokens = gathered.sum(axis=1)
+        if tokens_per_expert is not None:
+            # E-170: reorder each token's k axis by expert id (ascending) and
+            # accumulate sequentially in fp32, matching torch's index_add_.
+            num_experts = tokens_per_expert.shape[0]
+            expert_offsets = paddle.zeros([num_experts + 1], dtype="int64")
+            expert_offsets[1:] = paddle.cumsum(tokens_per_expert, axis=0)
+            slot_expert = paddle.searchsorted(
+                expert_offsets[1:], gather_index_flat, right=True
+            ).reshape([num_tokens, topk])
+            k_order = paddle.argsort(slot_expert, axis=-1)  # [N, topk]
+            gathered = paddle.take_along_axis(gathered, k_order.unsqueeze(-1).expand([num_tokens, topk, hidden]), axis=1)
+            output_tokens = paddle.zeros([num_tokens, hidden], dtype="float32")
+            for _k in range(topk):
+                output_tokens = output_tokens + gathered[:, _k, :]
+        else:
+            output_tokens = gathered.sum(axis=1)
         return output_tokens.cast(ctx.input_dtype)
 
     @staticmethod
@@ -292,6 +308,21 @@ def _unpermute_gather_sum_aligned(
     if topk == 0:
         return paddle.zeros(restore_shape, dtype=permuted_tokens.dtype)
 
+    # E-170: torch (deterministic) unpermute accumulates with index_add_ in the
+    # PERMUTED ROW order, i.e. for each token its expert contributions arrive in
+    # EXPERT-ASCENDING order (permuted storage is expert-major). Paddle's plain
+    # gather+sum(axis=1) accumulates in router topk order (score order), which
+    # differs when the router's topk order != expert-id order and flips a few
+    # fp32 1-ulps in the combined output (observed on non-60-length samples).
+    # When the env gate is on, reorder each token's k axis by expert id and add
+    # the topk contributions sequentially in fp32 (same order as torch).
+    _order_gate = os.environ.get("MODEL_REPRO_MOE_UNPERM_EXPERT_ORDER", "0") == "1"
+    tokens_per_expert = None
+    if _order_gate:
+        tokens_per_expert = (
+            routing_map.cast("int64").sum(axis=0).astype("int64")
+        )  # [num_experts]
+
     return _UnpermuteGatherSumAlignedPyLayer.apply(
         permuted_tokens,
         gather_index_flat,
@@ -301,6 +332,7 @@ def _unpermute_gather_sum_aligned(
         topk,
         hidden,
         has_padding,
+        tokens_per_expert,
     )
 
 

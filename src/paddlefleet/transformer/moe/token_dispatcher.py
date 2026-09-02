@@ -974,6 +974,24 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
     ):
         self.hidden_shape = hidden_states.shape
         hidden_states = hidden_states.view([-1, self.hidden_shape[-1]])
+        # E-753: UAC+fusion decoder DeepEP hidden reshape contiguous before
+        # fused_dispatch. Torch Flex dispatch_preprocess also views then
+        # fused_dispatch does x.contiguous(). Paddle fused_dispatch already
+        # contiguous-s x; this materializes the view at preprocess so the
+        # DeepEP operand is a dense [T H] buffer not a reshape view.
+        # Not routing mutate. Not skip-barrier. Not async_finish. Not
+        # allocate_on_comm_stream. Not fused_combine wrap. Not MTP.
+        # Needle has no comma (E-690 fail-closed).
+        if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+            hidden_states = hidden_states.reshape(
+                [-1, self.hidden_shape[-1]]
+            ).contiguous()
+            if not getattr(self, "_e753_dispatch_hidden_logged", False):
+                self._e753_dispatch_hidden_logged = True
+                print(
+                    "E-753: UAC+fusion decoder DeepEP hidden reshape contiguous before fused_dispatch",
+                    flush=True,
+                )
         self._comm_manager.setup_metadata(
             routing_map, probs, topk_weights, topk_indices
         )

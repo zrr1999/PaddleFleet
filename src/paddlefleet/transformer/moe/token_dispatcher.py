@@ -644,6 +644,30 @@ class _DeepEPManager(_DispatchManager):
         # dispatch fail-closed paddle LossNan (exit 1). Torch control
         # stayed E-668 12.02612686. Not a 0diff closer. Restore default
         # async_finish=False. Needle left in comments only.
+        # E-747: decoder live DeepEP routing columns sorted by expert id
+        # before fused_dispatch. E-673 decoder dispatched_hs exact but
+        # indices/probs column permutation differs. E-746 dropping router
+        # topk was inert vs E-697. Not fused_combine. Not MTP. Not
+        # alltoall. Needle has no comma (E-690 fail-closed).
+        if (
+            os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
+            and self.token_indices is not None
+            and self.token_probs is not None
+            and self.token_indices.ndim == 2
+        ):
+            _order = paddle.argsort(self.token_indices, axis=-1)
+            self.token_indices = paddle.take_along_axis(
+                self.token_indices, _order, axis=-1
+            )
+            self.token_probs = paddle.take_along_axis(
+                self.token_probs, _order, axis=-1
+            )
+            if not getattr(self, "_e747_decoder_colsort_logged", False):
+                self._e747_decoder_colsort_logged = True
+                print(
+                    "E-747: UAC+fusion decoder DeepEP operands sort routing columns by expert id",
+                    flush=True,
+                )
         hidden_states, dispatched_probs, states, scale = fused_dispatch(
             hidden_states,
             self.token_indices,

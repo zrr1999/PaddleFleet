@@ -474,6 +474,21 @@ def fused_dispatch_forward_func(
                 "E-754: UAC+fusion Buffer.dispatch waits on get_dispatch_layout event like torch FusedDispatch",
                 flush=True,
             )
+    # E-760: UAC+fusion Buffer.dispatch passes expert_alignment=1
+    # (DeepEP default, previously implicit). Aligns received token
+    # counts per local expert. Not unzip int64 (E-759). Not after-event
+    # wait (E-758). Not FusionMoe-entry contiguous. Not dispatch-out
+    # sort. Not layout-event. Not hidden reshape. Not skip-barrier.
+    # Not async-alloc. Not fused_dispatch-entry routing. Not
+    # fused_combine wrap. Needle has no comma (E-690 fail-closed).
+    if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+        dispatch_kwargs["expert_alignment"] = 1
+        if not getattr(fused_dispatch_forward_func, "_e760_logged", False):
+            fused_dispatch_forward_func._e760_logged = True
+            print(
+                "E-760: UAC+fusion Buffer.dispatch passes expert_alignment=1",
+                flush=True,
+            )
     (
         recv_x,
         recv_token_indices,

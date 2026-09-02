@@ -670,12 +670,24 @@ class _DeepEPManager(_DispatchManager):
         # E-694 skipped the barrier on fused_combine only. Needle has
         # no comma (E-690 fail-closed).
         dispatch_barrier = self.moe_ep_barrier
+        dispatch_alloc = False
         if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
             dispatch_barrier = False
             if not getattr(self, "_e751_dispatch_logged", False):
                 self._e751_dispatch_logged = True
                 print(
                     "E-751: UAC+fusion DeepEP dispatch skips moe_ep_barrier like torch FusedDispatch",
+                    flush=True,
+                )
+            # E-752: UAC+fusion DeepEP dispatch allocate_on_comm_stream like
+            # torch Flex token_dispatch. Torch default is True; paddle
+            # fused_dispatch default is False. Do not force async_finish
+            # (E-734 LossNan). Needle has no comma (E-690 fail-closed).
+            dispatch_alloc = True
+            if not getattr(self, "_e752_dispatch_alloc_logged", False):
+                self._e752_dispatch_alloc_logged = True
+                print(
+                    "E-752: UAC+fusion DeepEP dispatch allocate_on_comm_stream like torch Flex token_dispatch",
                     flush=True,
                 )
         hidden_states, dispatched_probs, states, scale = fused_dispatch(
@@ -686,6 +698,7 @@ class _DeepEPManager(_DispatchManager):
             self.group,
             fp8_dispatch=fp8_dispatch,
             async_finish=async_finish,
+            allocate_on_comm_stream=dispatch_alloc,
             moe_ep_barrier=dispatch_barrier,
             use_ue8m0=use_ue8m0,
             using_sonic_moe=using_sonic_moe,

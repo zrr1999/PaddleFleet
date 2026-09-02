@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import os
 import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -556,6 +557,72 @@ class GPTEmbedding(FleetLayer):
                                 )
                                 .permute(1, 0, 2)
                                 .contiguous()
+                            )
+                        # E-467: second GradNode on the SAME weight without
+                        # replacing the concat slice that enorm consumes.
+                        # The fused slice stays the PP/enorm carrier (not
+                        # E-409/E-416/E-417 STE). The extra lookup is NOT
+                        # fed into concat. Dummy `looked.sum()*0` keeps the
+                        # second IndexingBackward in the graph so MixPrecision
+                        # sees two tmp_grad hits; it is not nested
+                        # out.backward (E-428/E-429) and not a hook that
+                        # returns zeros (E-419).
+                        if os.environ.get(
+                            "MODEL_REPRO_STAGE0_SECOND_LOOKUP", ""
+                        ) == "1" and getattr(
+                            self.config, "use_accuracy_compatible", False
+                        ):
+                            seq_length_ids = (
+                                input_ids.shape[1]
+                                - self.config.num_nextn_predict_layers
+                            )
+                            mtp_ids = input_ids[
+                                :,
+                                (depth + 1) : (depth + 1 + seq_length_ids),
+                            ]
+                            looked = self.embedding(
+                                input_ids=mtp_ids,
+                                position_ids=None,
+                            )
+                            if (
+                                get_context_parallel_world_size() > 1
+                                and self.config.experimental_dataflow
+                            ):
+                                looked = ContextParallelScatterOp.apply(
+                                    looked,
+                                    axis=1,
+                                    mode=self.config.cp_balance_mode,
+                                )
+                            if self.sequence_parallel:
+                                looked = looked.reshape(
+                                    [-1, looked.shape[-1]]
+                                )
+                                looked = ScatterOp.apply(looked)
+                                looked = (
+                                    looked.reshape(
+                                        [batch_size, -1, hidden_size]
+                                    )
+                                    .permute(1, 0, 2)
+                                    .contiguous()
+                                )
+                            # Forward value stays the fused concat-slice
+                            # (enorm identity). Backward of this MTP slot
+                            # hits `looked` (second IndexingBackward) and
+                            # not ConcatGrad of the 61-id gather.
+                            # Distinct from E-409 (lookup had no ScatterOp)
+                            # and E-417 (STE replaced the concat object
+                            # enorm consumes). Here the fused slice is
+                            # still built; only its backward is retargeted.
+                            inputs_embeds_mtp = (
+                                inputs_embeds_mtp.detach()
+                                + (looked - looked.detach())
+                            )
+                            print(
+                                "[STAGE0-SECOND-LOOKUP] "
+                                "armed depth="
+                                f"{depth} looked={tuple(looked.shape)} "
+                                f"carrier={tuple(inputs_embeds_mtp.shape)}",
+                                flush=True,
                             )
                         mtp_emb_res.append(inputs_embeds_mtp)
 

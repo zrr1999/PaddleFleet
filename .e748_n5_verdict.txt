@@ -1,0 +1,1 @@
+E-748 N=5 dump-off unique ckpt_e748p2e2_* decoder routing-column sort via index_sample fail-closed: paddle index_sample_grad segfault exit 241 after needle. Torch IEEE-equal E-668. Injector disconnected. n100_allowed=false.

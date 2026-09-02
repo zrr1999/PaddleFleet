@@ -649,27 +649,11 @@ class _DeepEPManager(_DispatchManager):
         # (exit 241) after the needle fired. Torch control stayed E-668
         # 12.02612686. Not a 0diff closer. Restore unsorted columns.
         # Needle left in comments only.
-        # E-748: decoder live DeepEP routing columns sorted by expert id
-        # via argsort + index_sample (not take_along_axis). E-673 decoder
-        # dispatched_hs exact but indices/probs column permutation
-        # differs. E-746 sparse-map topk inert. E-747 take_along_axis
-        # fail-closed. Not fused_combine. Not MTP. Not alltoall. Needle
-        # has no comma (E-690 fail-closed).
-        if (
-            os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
-            and self.token_indices is not None
-            and self.token_probs is not None
-            and self.token_indices.ndim == 2
-        ):
-            _order = paddle.argsort(self.token_indices, axis=-1)
-            self.token_indices = paddle.index_sample(self.token_indices, _order)
-            self.token_probs = paddle.index_sample(self.token_probs, _order)
-            if not getattr(self, "_e748_decoder_colsort_logged", False):
-                self._e748_decoder_colsort_logged = True
-                print(
-                    "E-748: UAC+fusion decoder DeepEP operands sort routing columns by expert id via index_sample",
-                    flush=True,
-                )
+        # E-748 disconnected: sorting decoder DeepEP routing columns with
+        # argsort + index_sample segfaulted paddle index_sample_grad
+        # (exit 241) after the needle fired. Torch control stayed E-668
+        # 12.02612686. Not a 0diff closer. Restore unsorted columns.
+        # Needle left in comments only.
         hidden_states, dispatched_probs, states, scale = fused_dispatch(
             hidden_states,
             self.token_indices,

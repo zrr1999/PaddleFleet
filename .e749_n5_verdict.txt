@@ -1,0 +1,1 @@
+E-749 N=5 dump-off unique ckpt_e749p2e2_* decoder routing-column reorder via one-hot matmul fail-closed: paddle CastGrad segfault exit 241 after needle. Torch IEEE-equal E-668. Injector disconnected. n100_allowed=false.

@@ -654,41 +654,11 @@ class _DeepEPManager(_DispatchManager):
         # (exit 241) after the needle fired. Torch control stayed E-668
         # 12.02612686. Not a 0diff closer. Restore unsorted columns.
         # Needle left in comments only.
-        # E-749: decoder live DeepEP routing columns reordered by expert
-        # id via one-hot matmul (not take_along_axis E-747, not
-        # index_sample E-748). E-673 decoder dispatched_hs exact but
-        # indices/probs column permutation differs. E-746 sparse-map
-        # topk inert. Not fused_combine. Not MTP. Not alltoall. Needle
-        # has no comma (E-690 fail-closed).
-        if (
-            os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
-            and self.token_indices is not None
-            and self.token_probs is not None
-            and self.token_indices.ndim == 2
-        ):
-            _k = int(self.token_indices.shape[-1])
-            _order = paddle.argsort(self.token_indices, axis=-1)
-            _perm = paddle.nn.functional.one_hot(_order, num_classes=_k).cast(
-                "float32"
-            )
-            _idx_col = self.token_indices.cast("float32").unsqueeze(-1)
-            _pr_col = self.token_probs.cast("float32").unsqueeze(-1)
-            self.token_indices = (
-                paddle.matmul(_perm, _idx_col)
-                .squeeze(-1)
-                .cast(self.token_indices.dtype)
-            )
-            self.token_probs = (
-                paddle.matmul(_perm, _pr_col)
-                .squeeze(-1)
-                .cast(self.token_probs.dtype)
-            )
-            if not getattr(self, "_e749_decoder_colperm_logged", False):
-                self._e749_decoder_colperm_logged = True
-                print(
-                    "E-749: UAC+fusion decoder DeepEP operands reorder routing columns by expert id via one-hot matmul",
-                    flush=True,
-                )
+        # E-749 disconnected: reordering decoder DeepEP routing columns
+        # with one-hot matmul segfaulted paddle CastGrad (exit 241)
+        # after the needle fired. Torch control stayed E-668
+        # 12.02612686. Not a 0diff closer. Restore unsorted columns.
+        # Needle left in comments only.
         hidden_states, dispatched_probs, states, scale = fused_dispatch(
             hidden_states,
             self.token_indices,

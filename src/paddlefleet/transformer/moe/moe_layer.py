@@ -1080,56 +1080,10 @@ class MoELayer(nn.Layer):
     ):
         hidden_states = self._project_to_latent(hidden_states)
         _fusion_moe_dump(hidden_states, "pre_dispatch", self.layer_number)
-        # E-743: MTP live DeepEP routing operands rebuilt from sparse [S,E]
-        # via paddle.topk instead of the router's topk tensors. Decoder
-        # keeps router topk (E-673 decoder dispatched_hs exact; MTP
-        # pre_dispatch DIFF). Not a clone wrap of fused_combine /
-        # dispatch_postprocess. Needle has no comma (E-690 fail-closed).
-        if (
-            os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
-            and getattr(self, "is_mtp_layer", False)
-        ):
-            topk_weights = None
-            topk_indices = None
-            if not getattr(self, "_e743_mtp_sparse_topk_logged", False):
-                self._e743_mtp_sparse_topk_logged = True
-                print(
-                    "E-743: UAC+fusion MTP DeepEP operands rebuild topk from sparse routing map",
-                    flush=True,
-                )
-        # E-744: MTP live hidden into DeepEP is fp32-roundtripped then
-        # recast to the original dtype. Changes token VALUES at the
-        # dispatch entry, not routing topk (E-743), not a clone wrap of
-        # fused_combine / dispatch_postprocess. Needle has no comma
-        # (E-690 fail-closed).
-        if (
-            os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
-            and getattr(self, "is_mtp_layer", False)
-        ):
-            _hs_dtype = hidden_states.dtype
-            hidden_states = hidden_states.cast("float32").cast(_hs_dtype)
-            if not getattr(self, "_e744_mtp_hidden_fp32_rt_logged", False):
-                self._e744_mtp_hidden_fp32_rt_logged = True
-                print(
-                    "E-744: UAC+fusion MTP DeepEP hidden fp32 roundtrip before dispatch",
-                    flush=True,
-                )
-        # E-745: MTP live hidden into DeepEP is multiplied by 2. Proves
-        # whether MTP hidden values reach the main loss. E-744 fp32
-        # roundtrip was IEEE-identity on bf16. Not clone wrap, not
-        # fused_combine, not Flex dispatch_postprocess, not E-743
-        # sparse-map topk. Needle has no comma (E-690 fail-closed).
-        if (
-            os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
-            and getattr(self, "is_mtp_layer", False)
-        ):
-            hidden_states = hidden_states * 2
-            if not getattr(self, "_e745_mtp_hidden_mul2_logged", False):
-                self._e745_mtp_hidden_mul2_logged = True
-                print(
-                    "E-745: UAC+fusion MTP DeepEP hidden multiplied by 2 before dispatch",
-                    flush=True,
-                )
+        # E-743/E-744/E-745 disconnected: MTP sparse-topk / fp32 roundtrip /
+        # hidden x2. E-743 step-1 inert vs E-697; E-745 x2 not on main-loss
+        # but moved steps 2-5 vs E-744. E-746 N=5 vs E-668 must not stack
+        # those MTP probes. Needles left in comments only.
         # E-746: decoder live DeepEP routing operands rebuilt from sparse
         # [S,E] via paddle.topk instead of router topk. E-673 decoder
         # dispatched_hs exact but indices/probs column permutation

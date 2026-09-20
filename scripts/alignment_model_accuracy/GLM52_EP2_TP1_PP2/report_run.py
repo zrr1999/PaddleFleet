@@ -45,12 +45,14 @@ ENV_FIELDS = {
 
 
 def fingerprint(path):
+    """Return {path, bytes, sha256} for a single file."""
     with path.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
     return {"path": str(path), "bytes": path.stat().st_size, "sha256": digest}
 
 
 def input_manifest(model, tokenizer, data):
+    """Fingerprint the frozen model/tokenizer/data inputs into a manifest dict."""
     files = [model / "config.json", tokenizer / "tokenizer.json"]
     for name in ("tokenizer_config.json", "chat_template.jinja"):
         if (tokenizer / name).is_file():
@@ -58,9 +60,11 @@ def input_manifest(model, tokenizer, data):
     index = model / "model.safetensors.index.json"
     if index.is_file():
         files.append(index)
-        names = sorted(
-            set(json.loads(index.read_text())["weight_map"].values())
-        )
+        index_data = json.loads(index.read_text())
+        weight_map = index_data.get("weight_map")
+        if not isinstance(weight_map, dict):
+            raise ValueError(f"safetensors index missing 'weight_map': {index}")
+        names = sorted(set(weight_map.values()))
         for name in names:
             path = model / name
             if Path(name).is_absolute() or ".." in Path(name).parts:
@@ -80,6 +84,7 @@ def input_manifest(model, tokenizer, data):
 
 
 def report_receipts(run):
+    """Echo each side's native env/input/loss receipts so CI cleanup cannot hide them."""
     for side in ("paddle", "torch"):
         for name in ("env.json", "input_receipt.json", "loss.json"):
             path = run / side / name
@@ -109,6 +114,7 @@ def report_receipts(run):
 
 
 def main():
+    """CLI entry: `inputs` writes the input manifest; `receipts` echoes native receipts."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("inputs", "receipts"))
     parser.add_argument("--run-dir", required=True, type=Path)

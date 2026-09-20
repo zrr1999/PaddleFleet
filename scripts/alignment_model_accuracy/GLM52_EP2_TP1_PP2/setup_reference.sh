@@ -71,6 +71,9 @@ uv pip install --no-config --python "${TORCH_PYTHON}" \
     # Keep the full DeepEP/NVSHMEM interface; CUDA12 lacks only the optional
     # NVLink-utilization scheduling hint used by CUDA13 internode launches.
     deep_ep_source="$(mktemp -d "${TORCH_VENV}/deep-ep-build.XXXXXX")"
+    # Remove the multi-GB DeepEP clone on any exit (success or failure) so a
+    # failed build does not leave it behind under the venv.
+    trap 'rm -rf "${deep_ep_source}"' EXIT
     git -C "${deep_ep_source}" init --quiet
     git -C "${deep_ep_source}" fetch --quiet --depth 1 \
         https://github.com/deepseek-ai/DeepEP.git \

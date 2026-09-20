@@ -35,8 +35,8 @@ if [[ ! -f "${MODEL_DIR}/model.safetensors" && ! -f "${MODEL_DIR}/model.safetens
     echo "missing GLM52 weights: expected model.safetensors or model.safetensors.index.json in ${MODEL_DIR}" >&2
     exit 1
 fi
-[[ ! -e "${RUN_DIR}" ]] || { echo "run directory already exists: ${RUN_DIR}" >&2; exit 1; }
-mkdir -p "${RUN_DIR}"
+mkdir -p "$(dirname "${RUN_DIR}")"
+mkdir "${RUN_DIR}" || { echo "run directory already exists: ${RUN_DIR}" >&2; exit 1; }
 # shellcheck disable=SC1091
 source "${TORCH_VENV}/bin/activate"
 cd "${WORKSPACE_DIR}"

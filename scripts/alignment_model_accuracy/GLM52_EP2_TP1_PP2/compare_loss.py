@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Compare GLM52 native per-step loss artifacts (Paddle vs Torch) for bit-exact IEEE64 equality."""
+
 import argparse
 import json
 import math
@@ -64,6 +66,7 @@ def _as_finite_float(v: Any) -> float:
 def validate_loss_artifact(
     obj: dict[str, Any], *, expected_framework: str, required_steps: int
 ) -> list[float]:
+    """Validate one native loss artifact and return its per-step loss list."""
     if required_steps < 1:
         _fail(f"required_steps must be >= 1, got {required_steps}")
     if obj.get("schema") != _SCHEMA:
@@ -152,6 +155,7 @@ def compare_loss_json(pf_path: str, mg_path: str, required_steps: int) -> int:
 
 
 def main():
+    """CLI entry: compare two loss.json artifacts; return 0 iff bit-identical."""
     parser = argparse.ArgumentParser(
         description="Compare GLM52 native 100-step loss artifacts"
     )

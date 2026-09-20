@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Unit tests for compare_loss.py loss-artifact validation and IEEE64 comparison."""
+
 import json
 import os
 import tempfile

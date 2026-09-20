@@ -50,10 +50,18 @@ uv pip install --no-config --python "${TORCH_PYTHON}" \
         export PATH="${TORCH_VENV}/bin:${PATH}"
     fi
     # Bridge 1.6.1 imports TE even though GLM52 accuracy mode disables TE kernels.
+    # --no-deps is REQUIRED: transformer-engine-torch's metadata resolves the
+    # transformer-engine backend to the CUDA-13 build (transformer-engine-cu13 +
+    # nvidia-*-cu13). Installed on top of this CUDA-12.9 venv (torch 2.12.1+cu129,
+    # nvidia-cublas-cu12 -> libcublas.so.12 only), TE then loads the cu13 core .so
+    # and dies at import with "OSError: libcublas.so.13: cannot open shared object
+    # file" before any training step. The cu12 TE backend
+    # (transformer-engine[core_cu12]==2.17.1) is already installed above, so build
+    # and install te-torch alone and keep the venv purely CUDA-12.
     NVTE_FRAMEWORK=pytorch NVTE_PYTORCH_FORCE_BUILD=TRUE \
         CPATH="${cuda_include_path}${CPATH:+:${CPATH}}" MAX_JOBS="${MAX_JOBS:-2}" \
         uv pip install --no-config --python "${TORCH_PYTHON}" --no-build-isolation --no-cache \
-        --no-binary transformer-engine-torch "transformer-engine-torch==2.17.1" \
+        --no-deps --no-binary transformer-engine-torch "transformer-engine-torch==2.17.1" \
         "torch==2.12.1+cu129"
     # Keep the full DeepEP/NVSHMEM interface; CUDA12 lacks only the optional
     # NVLink-utilization scheduling hint used by CUDA13 internode launches.

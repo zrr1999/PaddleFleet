@@ -34,7 +34,12 @@ uv pip install --no-config --python "${TORCH_PYTHON}" \
     "torch==2.12.1+cu129" "ms-swift[megatron]==4.5.0.dev0" "mcore-bridge==1.6.1" \
     "transformers==5.12.1" "pynvml==13.0.1" \
     "setuptools>=66.1.0" pip wheel packaging "ninja==1.11.1.1" \
-    "pybind11[global]>=2.13,<3" tensorboard "transformer-engine[core_cu12]==2.17.1"
+    "pybind11[global]>=2.13,<3" tensorboard "transformer-engine[core_cu12]==2.17.1" \
+    einops onnxscript onnx pydantic nvdlfw-inspect
+# einops/onnxscript/onnx/pydantic/nvdlfw-inspect are transformer-engine-torch's own
+# runtime deps (imported by transformer_engine.pytorch at load); install them here
+# because the te-torch build below uses --no-deps to keep out the cu13 backend, which
+# would otherwise also drop these benign deps and break `import transformer_engine.pytorch`.
 (
     # Compiler provisioning and build variables stay within this subprocess.
     GLM52_CUDA_ROOT="${TORCH_VENV}/cuda-12.9.1"
@@ -86,5 +91,24 @@ uv pip install --no-config --python "${TORCH_PYTHON}" \
 # wheel repack cannot silently drift the reference off the aligned math runtime.
 uv pip install --no-config --python "${TORCH_PYTHON}" --no-deps \
     --index-url https://pypi.org/simple/ "nvidia-cublas-cu12==12.9.1.4"
-uv pip check --python "${TORCH_PYTHON}"
+# te-torch's published metadata hard-requires transformer-engine-cu13, but GLM52
+# builds te-torch from source against CUDA-12.9 and uses the cu12 backend
+# (transformer-engine[core_cu12]) installed above; the cu13 backend is
+# intentionally absent (see --no-deps on the te-torch build) so the venv stays
+# CUDA-12 only and TE loads libcublas.so.12. Tolerate exactly that one declared
+# incompatibility (mirrors setup_paddle.sh's cuBLAS handling); reject any other.
+check_log="${TORCH_VENV}/glm52-dependency-check.log"
+check_status=0
+uv pip check --python "${TORCH_PYTHON}" >"${check_log}" 2>&1 || check_status=$?
+cat "${check_log}"
+if [[ "${check_status}" -ne 0 ]]; then
+    check_output="$(cat "${check_log}")"
+    if [[ "${check_status}" -ne 1 \
+        || "${check_output}" != *"Found 1 incompatibility"* \
+        || "${check_output}" != *"transformer-engine-torch"*"transformer-engine-cu13"* \
+        || "${check_output}" != *"not installed"* ]]; then
+        exit "${check_status}"
+    fi
+    echo "GLM52 keeps the reference venv CUDA-12 only; te-torch's declared transformer-engine-cu13 backend is intentionally absent."
+fi
 "${TORCH_PYTHON}" -c 'import importlib.metadata as m; print({p: m.version(p) for p in ("torch", "mcore-bridge", "megatron-core", "ms-swift", "transformers")})'

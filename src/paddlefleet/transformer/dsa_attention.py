@@ -49,11 +49,15 @@ from paddlefleet.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
 )
 from paddlefleet.tensor_parallel.random import _fork_rng
+from paddlefleet.train_infer_consistent_ops.inspect_util import (
+    get_current_layer,
+    inspect_tensor,
+)
 from paddlefleet.transformer.cp_utils import all_gather_cp
 from paddlefleet.transformer.dw_overlap import deferrable_linear
 from paddlefleet.transformer.enums import AttnMaskType
 from paddlefleet.transformer.layer import FleetLayer
-from paddlefleet.utils import get_pg_size
+from paddlefleet.utils import get_pg_size, use_dsv4_accuracy_compatible
 
 try:
     from paddlefleet_ops.fast_hadamard_transform import (
@@ -216,6 +220,11 @@ def hadamard_transform(x: Tensor, scale: float = 1.0) -> Tensor:
     assert dim > 0 and (dim & (dim - 1)) == 0, (
         f"hadamard_transform requires dim to be a power of 2, got {dim}"
     )
+
+    if use_dsv4_accuracy_compatible():
+        from paddlefleet.accuracy_compatible_patch import CompatibleHadamard
+
+        return CompatibleHadamard.apply(x, scale)
 
     # Megatron uses fast_hadamard_transform, whose bf16 path accumulates in fp32
     # and casts back to bf16. Keep the same numeric contract here.
@@ -793,6 +802,7 @@ class DSAIndexer(paddle.nn.Layer):
             rotary_interleaved=self.config.dsa_indexer_rotary_interleaved,
             multi_latent_attention=False,
             mscale=mscale,
+            high_precision_rope=self.config.high_precision_rope,
         )
         return paddle.concat([x_pe, x_nope], axis=-1)
 
@@ -861,6 +871,13 @@ class DSAIndexer(paddle.nn.Layer):
             else freqs
         )
 
+        q_latent = inspect_tensor(
+            "mla_indexer_q_latent", get_current_layer(), q_latent
+        )
+        hidden_states = inspect_tensor(
+            "mla_indexer_hidden_states", get_current_layer(), hidden_states
+        )
+
         # IEEE e468: Indexer GEMMs must use F.linear under UAC, not
         # Linear.forward / deferrable_linear. Gate on the import-time
         # module constant, not a per-call FLAG read.
@@ -877,16 +894,32 @@ class DSAIndexer(paddle.nn.Layer):
             k, _ = deferrable_linear(
                 self.config, "attn_indexer_k_proj", self.wk, hidden_states
             )  # [b, s, head_dim]
+
+        q = inspect_tensor("mla_indexer_q_proj", get_current_layer(), q)
+        k = inspect_tensor("mla_indexer_k_proj", get_current_layer(), k)
+
         q = q.reshape([bsz, seqlen, self.n_heads, self.head_dim])
         q = self._apply_rope(q, freqs_q, mscale)
+
+        q = inspect_tensor("mla_indexer_q_rope", get_current_layer(), q)
+
         if cp_size > 1:
             k = all_gather_cp(k, dim=1, group=cp_group)  # [b, s_global, hd]
         k = self.k_norm(k)
+
+        k = inspect_tensor("mla_indexer_k_norm", get_current_layer(), k)
+
         k = self._apply_rope(k.unsqueeze(2), freqs, mscale).squeeze(2)
+
+        k = inspect_tensor("mla_indexer_k_rope", get_current_layer(), k)
 
         # Rotate activation (Hadamard transform)
         q = rotate_activation(q, use_fast_hadamard=self.use_fast_hadamard)
         k = rotate_activation(k, use_fast_hadamard=self.use_fast_hadamard)
+
+        q = inspect_tensor("mla_indexer_q_hadamard", get_current_layer(), q)
+
+        k = inspect_tensor("mla_indexer_k_hadamard", get_current_layer(), k)
 
         if self.config.use_accuracy_compatible and not (
             self.config.use_accuracy_compatible
@@ -902,6 +935,11 @@ class DSAIndexer(paddle.nn.Layer):
                 self.weights_proj,
                 hidden_states,
             )
+
+        weights = inspect_tensor(
+            "mla_indexer_weights_proj", get_current_layer(), weights
+        )
+
         weights = weights * (self.n_heads**-0.5) * self.softmax_scale
 
         return q, k, weights
@@ -1407,9 +1445,17 @@ def _bwd_fused_indexer_loss(
         "bsht,btd->bshd", grad_scores, k.cast("float32")
     )  # [b, sq, h, d]
     # ∂L/∂k = einsum('bsht,bshd->btd', grad_scores, q)
-    grad_k = paddle.einsum(
-        "bsht,bshd->btd", grad_scores, q.cast("float32")
-    )  # [b, sk, d]
+    if use_dsv4_accuracy_compatible():
+        from paddlefleet.accuracy_compatible_patch import compatible_einsum
+
+        grad_k = compatible_einsum(
+            grad_scores.transpose([1, 0, 2, 3]).contiguous(),
+            q.transpose([1, 0, 2, 3]).contiguous(),
+        ).transpose([1, 0, 2])
+    else:
+        grad_k = paddle.einsum(
+            "bsht,bshd->btd", grad_scores, q.cast("float32")
+        )  # [b, sk, d]
     del grad_scores
 
     return (

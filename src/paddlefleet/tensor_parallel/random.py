@@ -38,7 +38,6 @@ from ..parallel_state import (
     get_expert_tensor_parallel_rank,
     get_tensor_model_parallel_rank,
 )
-from ..recompute_utils import RecomputeStore
 
 HAVE_TE = False
 

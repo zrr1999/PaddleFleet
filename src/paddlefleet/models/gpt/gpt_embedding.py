@@ -353,7 +353,7 @@ class GPTEmbedding(FleetLayer):
         # structure carrier. Main path slices input_ids[:, :-num_nextn]
         # and is unchanged.
         if (
-            self.config.use_accuracy_compatible
+            getattr(self.config, "use_accuracy_compatible", False)
             and input_ids is not None
             and self.config.num_nextn_predict_layers is not None
             and self.config.num_nextn_predict_layers > 0
@@ -447,7 +447,7 @@ class GPTEmbedding(FleetLayer):
         if decoder_input is None:
             mtp_depth = self.config.num_nextn_predict_layers
             detach_mtp_tail = (
-                self.config.use_accuracy_compatible
+                getattr(self.config, "use_accuracy_compatible", False)
                 and not getattr(self.config, "use_erndata", False)
                 and mtp_depth > 0
                 and not self.config.mtp_load_weight_only
@@ -484,7 +484,7 @@ class GPTEmbedding(FleetLayer):
             if (
                 self.config.expert_model_parallel_size > 1
                 and self.config.tensor_model_parallel_size < 2
-                and not (self.config.use_accuracy_compatible)
+                and not (getattr(self.config, "use_accuracy_compatible", False))
             ) or self.config.gpt_model_use_experimental_version:
                 pad_token_id = getattr(self.config, "pad_token_id", 0)
                 if pad_token_id is None:
@@ -831,7 +831,9 @@ class GPTEmbedding(FleetLayer):
                             # Second GradNode after ScatterOp plus fp32
                             # main_grad scatter. MixPrecision cannot
                             # add_(bf16) on the second hit.
-                            if self.config.use_accuracy_compatible:
+                            if getattr(
+                                self.config, "use_accuracy_compatible", False
+                            ):
                                 seq_length_ids = (
                                     input_ids.shape[1]
                                     - self.config.num_nextn_predict_layers
@@ -841,7 +843,11 @@ class GPTEmbedding(FleetLayer):
                                     (depth + 1) : (depth + 1 + seq_length_ids),
                                 ]
                                 if (
-                                    self.config.use_accuracy_compatible
+                                    getattr(
+                                        self.config,
+                                        "use_accuracy_compatible",
+                                        False,
+                                    )
                                     and get_pg_size(self.embedding.tp_group)
                                     <= 1
                                 ):

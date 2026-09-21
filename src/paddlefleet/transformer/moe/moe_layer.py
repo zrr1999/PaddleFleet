@@ -117,6 +117,19 @@ from .moe_utils import (
 )
 
 
+def use_accuracy_compatible_kernel() -> bool:
+    """Unified switch for accuracy-compatible (Megatron-aligned) numeric paths.
+
+    Controlled via the ``FLAGS_use_accuracy_compatible_kernel`` environment
+    variable. When enabled, modules switch to fp32-accumulating / Torch-aligned
+    kernels at the cost of throughput. The GLM52 alignment already requires
+    ``FLAGS_use_accuracy_compatible_kernel=1``, so gating ``expert_forward`` on
+    this flag is equivalent to the config switch for GLM52 while restoring the
+    develop-side call site that ``test_dsv4_flag_gating_moe`` pins/patches.
+    """
+    return os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
+
+
 class _AccuracyCompatibleMoEInputBranches(PyLayer):
     """Fan out MoE input branches and combine their dgrads in Megatron order."""
 
@@ -377,23 +390,37 @@ class MoELayer(nn.Layer):
             "ringmoe",
         )
         self.moe_allgather_gate_overlap = config.moe_allgather_gate_overlap
-        if (
-            self.use_accuracy_compatible
-            and not use_dsv4_accuracy_compatible()
-            and not (
+        if self.use_accuracy_compatible and not use_dsv4_accuracy_compatible():
+            # The rewrite swaps the communication implementation only: the
+            # layout flags above stay keyed to the *configured* dispatcher so
+            # expert construction and the checkpoint shard declarations keep
+            # agreeing. That is consistent only for dispatchers using the plain
+            # per-device expert layout, so reject the intermediate-EP ones
+            # instead of pairing all-to-all communication with I // EP experts.
+            if self.use_intermediate_ep_sharding:
+                raise ValueError(
+                    "use_accuracy_compatible=True forces the all-to-all token "
+                    "dispatcher, which is incompatible with "
+                    "moe_token_dispatcher_type="
+                    f"'{self.moe_token_dispatcher_type}': 'allgather' and "
+                    "'ringmoe' shard every expert along its intermediate "
+                    "dimension, so the experts would be built for a layout "
+                    "the all-to-all path never produces. Please set "
+                    "moe_token_dispatcher_type='alltoall' (or 'deepep') in "
+                    "the configuration yaml."
+                )
+            # GLM52 IEEE fused experts retain their explicitly selected EP
+            # backend; ordinary compatibility mode keeps the all-to-all path.
+            ieee_deepep_fusion = (
                 self.config.use_accuracy_compatible
-                and config.moe_expert_fusion
+                and getattr(config, "moe_expert_fusion", False)
                 and self.moe_token_dispatcher_type == "deepep"
+                and pg_collection is not None
                 and pg_collection.ep is not None
                 and utils.get_pg_size(pg_collection.ep) > 1
             )
-        ):
-            # IEEE fused experts retain their explicitly selected EP backend.
-            # Ordinary compatibility mode keeps the existing all-to-all path.
-            # Gated to the non-dsv4 path (use_dsv4_accuracy_compatible() False):
-            # the dsv4 accuracy route manages its own token dispatcher and must
-            # not be forced onto all-to-all here.
-            self.moe_token_dispatcher_type = "alltoall"
+            if not ieee_deepep_fusion:
+                self.moe_token_dispatcher_type = "alltoall"
         self.use_hybrid_ep_backend = False
         self.moe_shared_expert_overlap = config.moe_shared_expert_overlap
         self.fp8 = config.fp8
@@ -1043,7 +1070,7 @@ class MoELayer(nn.Layer):
             dispatched_input, num_or_sections=tokens_per_expert, axis=0
         )
         scale_chunks = None
-        if self.config.use_accuracy_compatible:
+        if use_accuracy_compatible_kernel():
             per_token_scale = getattr(
                 self.token_dispatcher, "global_input_probs", None
             )
@@ -1052,7 +1079,7 @@ class MoELayer(nn.Layer):
             # them exactly once during the aligned unpermute/combine path.
             if per_token_scale is None and not use_dsv4_accuracy_compatible():
                 raise RuntimeError(
-                    "use_accuracy_compatible requires dispatched "
+                    "FLAGS_use_accuracy_compatible_kernel requires dispatched "
                     "router probabilities from the token dispatcher."
                 )
             if per_token_scale is not None:
@@ -1980,9 +2007,10 @@ class MoELayer(nn.Layer):
         )
         if (
             not _hf_bitexact_paths
+            and getattr(self, "config", None) is not None
             and self.config.use_accuracy_compatible
             and not _three_paths_enabled
-            and self.shared_experts is not None
+            and getattr(self, "shared_experts", None) is not None
             and self.expert_model_parallel_size <= 1
         ):
             hidden_states, router_hidden_states, residuals = (

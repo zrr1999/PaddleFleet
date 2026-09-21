@@ -25,7 +25,7 @@ uv pip install --python "${PADDLE_PYTHON}" \
 uv pip install --python "${PADDLE_PYTHON}" --no-config \
     --index-url https://www.paddlepaddle.org.cn/packages/nightly/cu129/ \
     --extra-index-url https://pypi.org/simple/ --index-strategy unsafe-best-match \
-    "paddlepaddle-gpu==3.4.0.post20260907" \
+    "paddlepaddle-gpu==3.4.0.post20260917" \
     "paddle-nvidia-nvshmem-cu12==3.4.5" "${PADDLEFLEET_WHEEL_PATH}"
 UV_SKIP_WHEEL_FILENAME_CHECK=1 uv pip install --python "${PADDLE_PYTHON}" --no-config \
     --index-url https://www.paddlepaddle.org.cn/packages/nightly/cu129/ \

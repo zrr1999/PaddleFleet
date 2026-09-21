@@ -2015,7 +2015,7 @@ class TopKRouter(StandardMoERouter):
                         and self.config.expert_model_parallel_size <= 1
                         else 1
                     ),
-                    use_fp32_master=self.use_fp32_master,
+                    use_fp32_master=getattr(self, "use_fp32_master", False),
                 )
 
         _log_moe_md5(logits, "gate_logits", self._layer_number)
